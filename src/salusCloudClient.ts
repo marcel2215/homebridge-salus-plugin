@@ -47,6 +47,7 @@ interface WriteAttempt {
 }
 
 type AuthorizationHeaderProfile = 'accessBearer' | 'idBearer' | 'accessRaw' | 'idRaw';
+type CompanyCodeCandidate = string | null;
 
 class HttpStatusError extends Error {
   constructor(
@@ -87,6 +88,22 @@ const RETRIABLE_ERROR_CODES = new Set([
   'UND_ERR_CONNECT_TIMEOUT',
   'UND_ERR_SOCKET',
 ]);
+const DEFAULT_COMPANY_CODE_FALLBACKS = [
+  'SALUS',
+  'SALUS_US',
+  'HEATLINK_US',
+  'MRPEX_US',
+  'NEOTHERM_EU',
+  'OMNIE_EU',
+  'PURMO',
+  'CLP_SG',
+  'CLP',
+  'HEATLINK',
+  'MRPEX',
+  'NEOTHERM',
+  'OMNIE',
+];
+const NO_COMPANY_CODE_SENTINEL = '__none__';
 
 const METADATA_FIELD_NAMES = new Set([
   'id',
@@ -127,6 +144,9 @@ export class SalusCloudClient {
   private readonly cognitoEndpoint: string;
   private readonly cognitoClientId: string;
   private readonly configuredCompanyCode: string | null;
+  private companyCodeCandidates: CompanyCodeCandidate[] = [];
+  private activeCompanyCode: CompanyCodeCandidate = null;
+  private hasWarnedAboutAuthCompanyCode = false;
 
   private activeServiceApiBaseUrl: string | null = null;
 
@@ -160,6 +180,7 @@ export class SalusCloudClient {
     this.cognitoClientId = normalizeNonEmptyString(config.cognitoClientId) ?? DEFAULT_COGNITO_CLIENT_ID;
     this.cognitoEndpoint = `https://cognito-idp.${cognitoRegion}.amazonaws.com/`;
     this.configuredCompanyCode = normalizeNonEmptyString(config.companyCode) ?? null;
+    this.refreshCompanyCodeCandidates();
 
     if (this.allowInsecureTls) {
       this.log.warn('TLS certificate validation is disabled for Salus cloud requests (allowInsecureTls=true).');
@@ -167,6 +188,7 @@ export class SalusCloudClient {
     if (this.verboseLogging) {
       this.log.debug(`Salus service-api candidates: ${this.serviceApiBaseCandidates.join(', ')}`);
       this.log.debug(`Salus Cognito endpoint: ${this.cognitoEndpoint}`);
+      this.log.debug(`Salus company-code candidates: ${this.companyCodeCandidates.map((candidate) => candidate ?? '<none>').join(', ')}`);
     }
   }
 
@@ -607,6 +629,47 @@ export class SalusCloudClient {
     });
   }
 
+  private refreshCompanyCodeCandidates(): void {
+    const candidates = buildCompanyCodeCandidates(this.configuredCompanyCode, this.session?.companyCode);
+    this.companyCodeCandidates = candidates;
+
+    if (this.activeCompanyCode && candidates.includes(this.activeCompanyCode)) {
+      return;
+    }
+
+    this.activeCompanyCode = candidates[0] ?? null;
+  }
+
+  private rotateCompanyCodeCandidate(
+    attemptedCompanyCodes: Set<string>,
+    preferredCode: string | undefined,
+  ): CompanyCodeCandidate {
+    if (preferredCode) {
+      const normalizedPreferred = normalizeNonEmptyString(preferredCode);
+      if (normalizedPreferred) {
+        const preferredKey = companyCodeCandidateKey(normalizedPreferred);
+        if (!attemptedCompanyCodes.has(preferredKey)) {
+          attemptedCompanyCodes.add(preferredKey);
+          this.activeCompanyCode = normalizedPreferred;
+          return normalizedPreferred;
+        }
+      }
+    }
+
+    for (const candidate of this.companyCodeCandidates) {
+      const key = companyCodeCandidateKey(candidate);
+      if (attemptedCompanyCodes.has(key)) {
+        continue;
+      }
+
+      attemptedCompanyCodes.add(key);
+      this.activeCompanyCode = candidate;
+      return candidate;
+    }
+
+    return null;
+  }
+
   private async ensureLoggedIn(): Promise<void> {
     if (this.session && Date.now() + SESSION_REFRESH_SAFETY_MS < this.session.expiresAtEpochMs) {
       return;
@@ -632,6 +695,7 @@ export class SalusCloudClient {
     this.authRequestInFlight = (async () => {
       this.session = null;
       this.session = await this.authenticateWithPassword();
+      this.refreshCompanyCodeCandidates();
       this.log.info('Authenticated with Salus cloud');
     })();
 
@@ -652,12 +716,14 @@ export class SalusCloudClient {
       if (!refreshToken) {
         this.session = null;
         this.session = await this.authenticateWithPassword();
+        this.refreshCompanyCodeCandidates();
         this.log.info('Authenticated with Salus cloud');
         return;
       }
 
       try {
         this.session = await this.authenticateWithRefreshToken(refreshToken);
+        this.refreshCompanyCodeCandidates();
       } catch (error) {
         this.session = null;
         throw error;
@@ -801,7 +867,8 @@ export class SalusCloudClient {
     const totalAttempts = this.maxRetries + 1;
 
     let hasRefreshedSessionAfter401 = false;
-    const attemptedAuthProfiles = new Set<AuthorizationHeaderProfile>([this.authorizationHeaderProfile]);
+    let attemptedAuthProfiles = new Set<AuthorizationHeaderProfile>([this.authorizationHeaderProfile]);
+    const attemptedCompanyCodes = new Set<string>([companyCodeCandidateKey(this.activeCompanyCode)]);
     let lastError: unknown = new Error(`No Salus cloud response received for ${options.method} ${path}`);
 
     for (let attempt = 1; attempt <= totalAttempts; attempt++) {
@@ -827,33 +894,58 @@ export class SalusCloudClient {
             body,
           });
 
-          if (response.status === 401 && authRequired && (options.allow401Refresh ?? true) && !hasRefreshedSessionAfter401) {
-            hasRefreshedSessionAfter401 = true;
-            this.log.warn(`Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}. Refreshing session token and retrying.`);
-            await this.refreshSession();
-            lastError = new HttpStatusError('Unauthorized', 401, '');
-            sawRetriableFailure = true;
-            lastRetriableError = lastError;
-            baseIndex -= 1;
-            continue;
-          }
-
           if (response.status === 401 && authRequired) {
-            const rotatedTo = rotateAuthorizationHeaderProfile(this.authorizationHeaderProfile);
-            if (rotatedTo !== this.authorizationHeaderProfile && !attemptedAuthProfiles.has(rotatedTo)) {
-              this.authorizationHeaderProfile = rotatedTo;
-              attemptedAuthProfiles.add(rotatedTo);
-              this.log.warn(`Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}. Retrying with alternate auth header profile: ${rotatedTo}.`);
-              lastError = new HttpStatusError('Unauthorized', 401, '');
+            const responseText = await safeReadText(response);
+            const responseCode = extractServiceResponseCode(responseText);
+            const hintedCompanyCode = extractCompanyCodeFromServiceAuthError(responseText);
+
+            if (responseCode === '900008' && !this.hasWarnedAboutAuthCompanyCode) {
+              this.hasWarnedAboutAuthCompanyCode = true;
+              this.log.warn(
+                'Salus cloud returned response_code=900008 (Not authorized). This often indicates tenant/company authorization context mismatch.',
+              );
+            }
+
+            if ((options.allow401Refresh ?? true) && !hasRefreshedSessionAfter401) {
+              hasRefreshedSessionAfter401 = true;
+              this.log.warn(`Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}. Refreshing session token and retrying.`);
+              await this.refreshSession();
+              lastError = new HttpStatusError('Unauthorized', 401, responseText);
               sawRetriableFailure = true;
               lastRetriableError = lastError;
               baseIndex -= 1;
               continue;
             }
-          }
 
-          if (response.status === 401 && authRequired) {
-            const responseText = await safeReadText(response);
+            const rotatedTo = rotateAuthorizationHeaderProfile(this.authorizationHeaderProfile);
+            if (rotatedTo !== this.authorizationHeaderProfile && !attemptedAuthProfiles.has(rotatedTo)) {
+              this.authorizationHeaderProfile = rotatedTo;
+              attemptedAuthProfiles.add(rotatedTo);
+              this.log.warn(`Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}. Retrying with alternate auth header profile: ${rotatedTo}.`);
+              lastError = new HttpStatusError('Unauthorized', 401, responseText);
+              sawRetriableFailure = true;
+              lastRetriableError = lastError;
+              baseIndex -= 1;
+              continue;
+            }
+
+            const previousCompanyCode = this.activeCompanyCode;
+            const rotatedCompanyCode = this.rotateCompanyCodeCandidate(attemptedCompanyCodes, hintedCompanyCode);
+            if (companyCodeCandidateKey(rotatedCompanyCode) !== companyCodeCandidateKey(previousCompanyCode)) {
+              this.authorizationHeaderProfile = 'accessBearer';
+              attemptedAuthProfiles = new Set<AuthorizationHeaderProfile>([this.authorizationHeaderProfile]);
+              this.log.warn(
+                rotatedCompanyCode
+                  ? `Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}. Retrying with alternate company code header: ${rotatedCompanyCode}.`
+                  : `Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}. Retrying without company code header.`,
+              );
+              lastError = new HttpStatusError('Unauthorized', 401, responseText);
+              sawRetriableFailure = true;
+              lastRetriableError = lastError;
+              baseIndex -= 1;
+              continue;
+            }
+
             const unauthorizedError = new HttpStatusError(
               responseText
                 ? `HTTP 401 Unauthorized on ${options.method} ${path} via ${baseUrl} :: ${responseText}`
@@ -927,6 +1019,9 @@ export class SalusCloudClient {
             lastError = error;
             sawRetriableFailure = true;
             lastRetriableError = error;
+            if (this.verboseLogging) {
+              this.log.debug(`Retriable network error for ${options.method} ${path} via ${baseUrl}: ${asErrorMessage(error)}`);
+            }
             continue;
           }
 
@@ -966,10 +1061,11 @@ export class SalusCloudClient {
       throw new Error('Missing Salus cloud session while building authenticated request.');
     }
 
+    const authToken = tokenForAuthorizationProfile(this.authorizationHeaderProfile, this.session.accessToken, this.session.idToken);
     headers.Authorization = formatAuthorizationHeader(this.authorizationHeaderProfile, this.session.accessToken, this.session.idToken);
     headers['x-access-token'] = this.session.accessToken;
-    headers['x-auth-token'] = this.session.idToken || this.session.accessToken;
-    const companyCode = this.configuredCompanyCode ?? this.session.companyCode;
+    headers['x-auth-token'] = authToken;
+    const companyCode = this.activeCompanyCode;
     if (companyCode) {
       headers['x-company-code'] = companyCode;
     }
@@ -1129,6 +1225,91 @@ function normalizeNonEmptyString(value: string | undefined): string | undefined 
     return undefined;
   }
   return trimmed;
+}
+
+function buildCompanyCodeCandidates(
+  configuredCompanyCode: string | null,
+  sessionCompanyCode: string | undefined,
+): CompanyCodeCandidate[] {
+  const normalizedConfigured = normalizeNonEmptyString(configuredCompanyCode ?? undefined) ?? null;
+  const normalizedSession = normalizeNonEmptyString(sessionCompanyCode);
+  const fallbackCandidates = DEFAULT_COMPANY_CODE_FALLBACKS
+    .map((value) => normalizeNonEmptyString(value))
+    .filter((value): value is string => Boolean(value));
+
+  const initialCandidates: CompanyCodeCandidate[] = normalizedConfigured
+    ? [normalizedConfigured, normalizedSession ?? null, null]
+    : [normalizedSession ?? null, null];
+
+  const seen = new Set<string>();
+  const deduped: CompanyCodeCandidate[] = [];
+  for (const candidate of [...initialCandidates, ...fallbackCandidates]) {
+    const key = companyCodeCandidateKey(candidate);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(candidate);
+  }
+
+  return deduped;
+}
+
+function companyCodeCandidateKey(candidate: CompanyCodeCandidate): string {
+  return candidate ?? NO_COMPANY_CODE_SENTINEL;
+}
+
+function tokenForAuthorizationProfile(
+  profile: AuthorizationHeaderProfile,
+  accessToken: string,
+  idToken: string,
+): string {
+  if (profile === 'idBearer' || profile === 'idRaw') {
+    return idToken;
+  }
+  return accessToken;
+}
+
+function extractServiceResponseCode(responseText: string): string | undefined {
+  if (!responseText) {
+    return undefined;
+  }
+
+  const parsed = parseJsonRecord(responseText);
+  if (!parsed) {
+    return undefined;
+  }
+
+  return asString(parsed.response_code)
+    ?? asString(parsed.code)
+    ?? asString(parsed.error_code);
+}
+
+function extractCompanyCodeFromServiceAuthError(responseText: string): string | undefined {
+  if (!responseText) {
+    return undefined;
+  }
+
+  const parsed = parseJsonRecord(responseText);
+  if (!parsed) {
+    return undefined;
+  }
+
+  const direct = asRecord(parsed.data) ?? parsed;
+  return extractCompanyCodeFromTokenClaims(direct);
+}
+
+function parseJsonRecord(value: string): Record<string, unknown> | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  try {
+    return asRecord(JSON.parse(trimmed));
+  } catch {
+    return undefined;
+  }
 }
 
 function parseCognitoTokens(payload: unknown, refreshTokenFallback?: string): CognitoSession | undefined {
