@@ -852,6 +852,21 @@ export class SalusCloudClient {
             }
           }
 
+          if (response.status === 401 && authRequired) {
+            const responseText = await safeReadText(response);
+            const unauthorizedError = new HttpStatusError(
+              responseText
+                ? `HTTP 401 Unauthorized on ${options.method} ${path} via ${baseUrl} :: ${responseText}`
+                : `HTTP 401 Unauthorized on ${options.method} ${path} via ${baseUrl}`,
+              401,
+              responseText,
+            );
+            lastError = unauthorizedError;
+            sawRetriableFailure = true;
+            lastRetriableError = unauthorizedError;
+            continue;
+          }
+
           if (!expectedStatuses.includes(response.status)) {
             const responseText = await safeReadText(response);
             const message = `HTTP ${response.status} ${response.statusText} on ${options.method} ${path}`;
@@ -1137,6 +1152,7 @@ function parseCognitoTokens(payload: unknown, refreshTokenFallback?: string): Co
   const refreshToken = asString(authResult.RefreshToken) ?? refreshTokenFallback;
   const tokenType = asString(authResult.TokenType) ?? 'Bearer';
   const decodedIdTokenClaims = decodeJwtPayload(idToken);
+  const decodedAccessTokenClaims = decodeJwtPayload(accessToken);
 
   const expiresInRaw = parseNumberLike(authResult.ExpiresIn);
   const expiresInSeconds = expiresInRaw && Number.isFinite(expiresInRaw) ? Math.max(60, Math.floor(expiresInRaw)) : 3600;
@@ -1151,7 +1167,7 @@ function parseCognitoTokens(payload: unknown, refreshTokenFallback?: string): Co
     refreshToken,
     tokenType,
     expiresAtEpochMs: Date.now() + (expiresInSeconds * 1_000),
-    companyCode: extractCompanyCodeFromTokenClaims(decodedIdTokenClaims),
+    companyCode: extractCompanyCodeFromTokenClaims(decodedIdTokenClaims, decodedAccessTokenClaims),
   };
 }
 
@@ -1175,35 +1191,36 @@ function formatAuthorizationHeader(
 function rotateAuthorizationHeaderProfile(current: AuthorizationHeaderProfile): AuthorizationHeaderProfile {
   const order: AuthorizationHeaderProfile[] = ['accessBearer', 'idBearer', 'accessRaw', 'idRaw'];
   const index = order.indexOf(current);
-  if (index === -1 || index >= order.length - 1) {
-    return current;
+  if (index === -1) {
+    return order[0]!;
   }
-  return order[index + 1]!;
+  return order[(index + 1) % order.length]!;
 }
 
-function extractCompanyCodeFromTokenClaims(claims: Record<string, unknown> | undefined): string | undefined {
-  if (!claims) {
-    return undefined;
-  }
+function extractCompanyCodeFromTokenClaims(...claimSets: Array<Record<string, unknown> | undefined>): string | undefined {
+  for (const claims of claimSets) {
+    if (!claims) {
+      continue;
+    }
 
-  const candidates = [
-    claims.companyCode,
-    claims.company_code,
-    claims['custom:companyCode'],
-    claims['custom:company_code'],
-    claims.tenantCode,
-    claims.tenant_code,
-    claims.tenantId,
-    claims.tenant_id,
-  ];
+    const candidates = [
+      claims.companyCode,
+      claims.company_code,
+      claims['custom:companyCode'],
+      claims['custom:company_code'],
+      claims.tenantCode,
+      claims.tenant_code,
+      claims.tenantId,
+      claims.tenant_id,
+    ];
 
-  for (const candidate of candidates) {
-    const normalized = normalizeNonEmptyString(asString(candidate));
-    if (normalized) {
-      return normalized;
+    for (const candidate of candidates) {
+      const normalized = normalizeNonEmptyString(asString(candidate));
+      if (normalized) {
+        return normalized;
+      }
     }
   }
-
   return undefined;
 }
 
