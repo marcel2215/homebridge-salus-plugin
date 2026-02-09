@@ -1,150 +1,369 @@
+/* eslint-disable @typescript-eslint/no-use-before-define */
+
 import type { API, Characteristic, DynamicPlatformPlugin, Logging, PlatformAccessory, PlatformConfig, Service } from 'homebridge';
 
-import { ExamplePlatformAccessory } from './platformAccessory.js';
+import { getCatalogEntry, inferKindFromCatalog } from './deviceCatalog.js';
+import { hasAnyPropertyBase } from './propertyUtils.js';
+import { SalusCloudClient } from './salusCloudClient.js';
+import { SalusPlatformAccessory } from './platformAccessory.js';
 import { PLATFORM_NAME, PLUGIN_NAME } from './settings.js';
+import type { DeviceProfile, PlatformAccessoryContext, SalusDevice, SalusPlatformConfig, SalusPropertyMap } from './types.js';
 
-// This is only required when using Custom Services and Characteristics not support by HomeKit
-import { EveHomeKitTypes } from 'homebridge-lib/EveHomeKitTypes';
+const DEFAULT_POLL_INTERVAL_SECONDS = 20;
+const DEFAULT_MAX_PARALLEL_PROPERTY_REQUESTS = 4;
+const MIN_POLL_INTERVAL_SECONDS = 10;
+const MAX_POLL_INTERVAL_SECONDS = 300;
 
-/**
- * HomebridgePlatform
- * This class is the main constructor for your plugin, this is where you should
- * parse the user config and discover/register accessories with Homebridge.
- */
-export class ExampleHomebridgePlatform implements DynamicPlatformPlugin {
+const THERMOSTAT_PROPERTY_BASES = [
+  'LocalTemperature_x100',
+  'HeatingSetpoint_x100',
+  'CoolingSetpoint_x100',
+  'SetHeatingSetpoint_x100',
+  'SetCoolingSetpoint_x100',
+  'SetSystemMode',
+  'SystemMode',
+  'RunningState',
+  'RunningMode',
+];
+const LOCK_PROPERTY_BASES = ['Lock', 'LockState', 'LockStatus', 'DoorLock'];
+const POSITION_PROPERTY_BASES = ['CurrentLevel', 'TargetLevel', 'LiftPercentage', 'CurrentPosition'];
+const ONOFF_PROPERTY_BASES = ['OnOff', 'SetOnOff', 'ValveStatus', 'ButtonStatus', 'Mode'];
+const BRIGHTNESS_PROPERTY_BASES = ['CurrentLevel', 'SetLevel', 'Brightness', 'DimLevel'];
+const MOTION_PROPERTY_BASES = ['Motion', 'Occupancy', 'IASZSAlarmed', 'ErrorIASZSAlarmed1'];
+const CONTACT_PROPERTY_BASES = ['Open', 'Door', 'Window', 'Contact'];
+const LEAK_PROPERTY_BASES = ['Leak', 'WaterLeak', 'ErrorIASZSAlarmed1'];
+const SMOKE_PROPERTY_BASES = ['Smoke', 'Heat', 'ErrorIASZSAlarmed1'];
+const CO_PROPERTY_BASES = ['CO', 'CarbonMonoxide'];
+const TEMPERATURE_PROPERTY_BASES = ['LocalTemperature_x100', 'MeasuredValue_x100', 'Temperature_x100'];
+const HUMIDITY_PROPERTY_BASES = ['Humidity', 'RelativeHumidity'];
+const AIR_QUALITY_PROPERTY_BASES = ['CO2', 'CarbonDioxide'];
+
+const UNSUPPORTED_CONSTRAINTS = [
+  'Schedules and calendar programs are not directly editable via HomeKit characteristics.',
+  'Salus multi-stage hold modes (holiday/boost/permanent/follow) are collapsed to HomeKit mode + target temperature.',
+  'Firmware management, binding/pairing topology and low-level diagnostics are cloud-only and not represented in HomeKit.',
+  'Advanced thermostat installer parameters (control algorithm, floor limits, valve protection tuning) are not exposed by HomeKit.',
+  'Energy history/consumption charts and alert-rule automation are not representable in the Home app UI.',
+];
+
+export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
   public readonly Service: typeof Service;
   public readonly Characteristic: typeof Characteristic;
-
-  // this is used to track restored cached accessories
   public readonly accessories: Map<string, PlatformAccessory> = new Map();
-  public readonly discoveredCacheUUIDs: string[] = [];
 
-  // This is only required when using Custom Services and Characteristics not support by HomeKit
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  public readonly CustomServices: any;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  public readonly CustomCharacteristics: any;
+  private readonly accessoryHandlers: Map<string, SalusPlatformAccessory> = new Map();
+  private readonly configTyped: SalusPlatformConfig;
+  private readonly cloudClient: SalusCloudClient | null;
+  private readonly pollIntervalMs: number;
+  private readonly maxParallelPropertyRequests: number;
+  private pollTimer: NodeJS.Timeout | null = null;
+  private pollInProgress = false;
+  private launchCompleted = false;
 
   constructor(
     public readonly log: Logging,
-    public readonly config: PlatformConfig,
+    config: PlatformConfig,
     public readonly api: API,
   ) {
     this.Service = api.hap.Service;
     this.Characteristic = api.hap.Characteristic;
+    this.configTyped = config as SalusPlatformConfig;
+    this.pollIntervalMs = Math.round(clamp(
+      this.configTyped.pollIntervalSeconds ?? DEFAULT_POLL_INTERVAL_SECONDS,
+      MIN_POLL_INTERVAL_SECONDS,
+      MAX_POLL_INTERVAL_SECONDS,
+    ) * 1_000);
+    this.maxParallelPropertyRequests = Math.max(
+      1,
+      Math.floor(this.configTyped.maxParallelPropertyRequests ?? DEFAULT_MAX_PARALLEL_PROPERTY_REQUESTS),
+    );
 
-    // This is only required when using Custom Services and Characteristics not support by HomeKit
-    this.CustomServices = new EveHomeKitTypes(this.api).Services;
-    this.CustomCharacteristics = new EveHomeKitTypes(this.api).Characteristics;
+    if (!this.configTyped.email || !this.configTyped.password) {
+      this.cloudClient = null;
+      this.log.error('Salus credentials are missing. Configure both "email" and "password" in Homebridge settings.');
+    } else {
+      this.cloudClient = new SalusCloudClient(this.log, this.configTyped);
+      this.log.info(`Configured Salus cloud endpoint: ${this.cloudClient.getCloudBaseUrl()}`);
+    }
 
-    this.log.debug('Finished initializing platform:', this.config.name);
-
-    // When this event is fired it means Homebridge has restored all cached accessories from disk.
-    // Dynamic Platform plugins should only register new accessories after this event was fired,
-    // in order to ensure they weren't added to homebridge already. This event can also be used
-    // to start discovery of new accessories.
     this.api.on('didFinishLaunching', () => {
-      log.debug('Executed didFinishLaunching callback');
-      // run the method to discover / register your devices as accessories
-      this.discoverDevices();
+      this.launchCompleted = true;
+      this.log.info('Homebridge launch completed. Starting Salus device discovery.');
+      this.schedulePoll(0);
     });
   }
 
-  /**
-   * This function is invoked when homebridge restores cached accessories from disk at startup.
-   * It should be used to set up event handlers for characteristics and update respective values.
-   */
-  configureAccessory(accessory: PlatformAccessory) {
-    this.log.info('Loading accessory from cache:', accessory.displayName);
-
-    // add the restored accessory to the accessories cache, so we can track if it has already been registered
+  configureAccessory(accessory: PlatformAccessory): void {
     this.accessories.set(accessory.UUID, accessory);
+    this.log.debug(`Restored cached accessory: ${accessory.displayName}`);
   }
 
-  /**
-   * This is an example method showing how to register discovered accessories.
-   * Accessories must only be registered once, previously created accessories
-   * must not be registered again to prevent "duplicate UUID" errors.
-   */
-  discoverDevices() {
-    // EXAMPLE ONLY
-    // A real plugin you would discover accessories from the local network, cloud services
-    // or a user-defined array in the platform config.
-    const exampleDevices = [
-      {
-        exampleUniqueId: 'ABCD',
-        exampleDisplayName: 'Bedroom',
-      },
-      {
-        exampleUniqueId: 'EFGH',
-        exampleDisplayName: 'Kitchen',
-      },
-      {
-        // This is an example of a device which uses a Custom Service
-        exampleUniqueId: 'IJKL',
-        exampleDisplayName: 'Backyard',
-        CustomService: 'AirPressureSensor',
-      },
-    ];
+  public async writeDeviceProperty(device: SalusDevice, propertyName: string, value: unknown): Promise<void> {
+    if (!this.cloudClient) {
+      throw new Error('Salus cloud client is not initialized due to missing credentials.');
+    }
+    try {
+      await this.cloudClient.setDatapoint(device.dsn, propertyName, value);
+      this.log.debug(`Set datapoint ${propertyName}=${JSON.stringify(value)} for ${device.name} (${device.dsn})`);
+      this.schedulePoll(2_000);
+    } catch (error) {
+      this.log.error(`Failed to set datapoint ${propertyName} on ${device.name}: ${asErrorMessage(error)}`);
+      throw error;
+    }
+  }
 
-    // loop over the discovered devices and register each one if it has not already been registered
-    for (const device of exampleDevices) {
-      // generate a unique id for the accessory this should be generated from
-      // something globally unique, but constant, for example, the device serial
-      // number or MAC address
-      const uuid = this.api.hap.uuid.generate(device.exampleUniqueId);
+  public getUnmappedConstraintList(): string[] {
+    return [...UNSUPPORTED_CONSTRAINTS];
+  }
 
-      // see if an accessory with the same uuid has already been registered and restored from
-      // the cached devices we stored in the `configureAccessory` method above
-      const existingAccessory = this.accessories.get(uuid);
+  private schedulePoll(delayMs: number): void {
+    if (!this.launchCompleted) {
+      return;
+    }
+    if (!this.cloudClient) {
+      return;
+    }
+    if (this.pollTimer) {
+      clearTimeout(this.pollTimer);
+      this.pollTimer = null;
+    }
+    this.pollTimer = setTimeout(() => {
+      void this.pollDevices();
+    }, Math.max(0, delayMs));
+  }
 
-      if (existingAccessory) {
-        // the accessory already exists
-        this.log.info('Restoring existing accessory from cache:', existingAccessory.displayName);
-
-        // if you need to update the accessory.context then you should run `api.updatePlatformAccessories`. e.g.:
-        // existingAccessory.context.device = device;
-        // this.api.updatePlatformAccessories([existingAccessory]);
-
-        // create the accessory handler for the restored accessory
-        // this is imported from `platformAccessory.ts`
-        new ExamplePlatformAccessory(this, existingAccessory);
-
-        // it is possible to remove platform accessories at any time using `api.unregisterPlatformAccessories`, e.g.:
-        // remove platform accessories when no longer present
-        // this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [existingAccessory]);
-        // this.log.info('Removing existing accessory from cache:', existingAccessory.displayName);
-      } else {
-        // the accessory does not yet exist, so we need to create it
-        this.log.info('Adding new accessory:', device.exampleDisplayName);
-
-        // create a new accessory
-        const accessory = new this.api.platformAccessory(device.exampleDisplayName, uuid);
-
-        // store a copy of the device object in the `accessory.context`
-        // the `context` property can be used to store any data about the accessory you may need
-        accessory.context.device = device;
-
-        // create the accessory handler for the newly create accessory
-        // this is imported from `platformAccessory.ts`
-        new ExamplePlatformAccessory(this, accessory);
-
-        // link the accessory to your platform
-        this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
-      }
-
-      // push into discoveredCacheUUIDs
-      this.discoveredCacheUUIDs.push(uuid);
+  private async pollDevices(): Promise<void> {
+    if (!this.cloudClient) {
+      return;
+    }
+    if (this.pollInProgress) {
+      this.log.warn('Previous Salus poll is still in progress; delaying next cycle.');
+      this.schedulePoll(2_000);
+      return;
     }
 
-    // you can also deal with accessories from the cache which are no longer present by removing them from Homebridge
-    // for example, if your plugin logs into a cloud account to retrieve a device list, and a user has previously removed a device
-    // from this cloud account, then this device will no longer be present in the device list but will still be in the Homebridge cache
+    this.pollInProgress = true;
+    const discoveredUuids = new Set<string>();
+
+    try {
+      const devices = await this.cloudClient.listDevices();
+      const uniqueDevices = dedupeDevicesByDsn(devices)
+        .filter((device) => !shouldIgnoreInfrastructureDevice(device));
+
+      const deviceSnapshots = await mapWithConcurrency(
+        uniqueDevices,
+        this.maxParallelPropertyRequests,
+        async (device) => {
+          try {
+            const properties = await this.cloudClient!.listProperties(device.dsn);
+            const profile = this.deriveProfile(device, properties);
+            return { device, properties, profile };
+          } catch (error) {
+            this.log.error(`Failed to fetch properties for ${device.name} (${device.dsn}): ${asErrorMessage(error)}`);
+            return null;
+          }
+        },
+      );
+
+      for (const snapshot of deviceSnapshots) {
+        if (!snapshot) {
+          continue;
+        }
+        const uuid = this.api.hap.uuid.generate(`salus:${snapshot.device.dsn}`);
+        discoveredUuids.add(uuid);
+        const existingAccessory = this.accessories.get(uuid);
+        if (existingAccessory) {
+          this.restoreOrUpdateAccessory(existingAccessory, snapshot.device, snapshot.profile, snapshot.properties);
+        } else {
+          this.addAccessory(snapshot.device, snapshot.profile, snapshot.properties, uuid);
+        }
+      }
+
+      this.removeStaleAccessories(discoveredUuids);
+      this.log.info(`Salus sync completed: ${deviceSnapshots.length} device(s) discovered.`);
+    } catch (error) {
+      this.log.error(`Salus sync failed: ${asErrorMessage(error)}`);
+    } finally {
+      this.pollInProgress = false;
+      this.schedulePoll(this.pollIntervalMs);
+    }
+  }
+
+  private addAccessory(device: SalusDevice, profile: DeviceProfile, properties: SalusPropertyMap, uuid: string): void {
+    const accessory = new this.api.platformAccessory(device.name, uuid);
+    const context = accessory.context as PlatformAccessoryContext;
+    context.device = {
+      id: device.id,
+      dsn: device.dsn,
+      key: device.key,
+      model: device.model,
+      name: device.name,
+    };
+    context.profile = profile;
+
+    const handler = new SalusPlatformAccessory(this, accessory, device, profile);
+    handler.updateFromCloud(device, profile, properties);
+
+    this.accessories.set(uuid, accessory);
+    this.accessoryHandlers.set(uuid, handler);
+    this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+    this.log.info(`Added accessory: ${device.name} [${device.model}] (${device.dsn})`);
+  }
+
+  private restoreOrUpdateAccessory(
+    accessory: PlatformAccessory,
+    device: SalusDevice,
+    profile: DeviceProfile,
+    properties: SalusPropertyMap,
+  ): void {
+    const needsNameUpdate = accessory.displayName !== device.name;
+    if (needsNameUpdate) {
+      accessory.displayName = device.name;
+    }
+
+    const context = accessory.context as PlatformAccessoryContext;
+    context.device = {
+      id: device.id,
+      dsn: device.dsn,
+      key: device.key,
+      model: device.model,
+      name: device.name,
+    };
+    context.profile = profile;
+    this.api.updatePlatformAccessories([accessory]);
+
+    let handler = this.accessoryHandlers.get(accessory.UUID);
+    if (!handler) {
+      handler = new SalusPlatformAccessory(this, accessory, device, profile);
+      this.accessoryHandlers.set(accessory.UUID, handler);
+    }
+
+    handler.updateFromCloud(device, profile, properties);
+  }
+
+  private removeStaleAccessories(discoveredUuids: Set<string>): void {
     for (const [uuid, accessory] of this.accessories) {
-      if (!this.discoveredCacheUUIDs.includes(uuid)) {
-        this.log.info('Removing existing accessory from cache:', accessory.displayName);
-        this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      if (discoveredUuids.has(uuid)) {
+        continue;
       }
+      this.log.info(`Removing stale accessory from cache: ${accessory.displayName}`);
+      this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      this.accessories.delete(uuid);
+      this.accessoryHandlers.delete(uuid);
     }
   }
+
+  private deriveProfile(device: SalusDevice, properties: SalusPropertyMap): DeviceProfile {
+    const catalog = getCatalogEntry(device.model);
+    const propertyInferredKind = inferKindFromProperties(properties);
+    const catalogInferredKind = inferKindFromCatalog(device.model);
+    const kind = propertyInferredKind ?? catalogInferredKind ?? 'switch';
+
+    const constraints = [...UNSUPPORTED_CONSTRAINTS];
+    if (kind === 'thermostat') {
+      constraints.push('Fan modes and multi-point cooling/heating bands are simplified to HomeKit thermostat controls.');
+    }
+    if (kind === 'lightbulb') {
+      constraints.push('Color scenes/vendor presets are not represented as HomeKit characteristics.');
+    }
+    if (kind === 'windowCovering') {
+      constraints.push('Proprietary roller modes (single/double light relay mode) are mapped to standard position controls.');
+    }
+
+    return {
+      kind,
+      catalog,
+      constraints,
+    };
+  }
+}
+
+function inferKindFromProperties(properties: SalusPropertyMap): DeviceProfile['kind'] | undefined {
+  if (hasAnyPropertyBase(properties, THERMOSTAT_PROPERTY_BASES)) {
+    return 'thermostat';
+  }
+  if (hasAnyPropertyBase(properties, LOCK_PROPERTY_BASES)) {
+    return 'lock';
+  }
+  if (hasAnyPropertyBase(properties, POSITION_PROPERTY_BASES)) {
+    return 'windowCovering';
+  }
+  if (hasAnyPropertyBase(properties, LEAK_PROPERTY_BASES)) {
+    return 'leakSensor';
+  }
+  if (hasAnyPropertyBase(properties, SMOKE_PROPERTY_BASES)) {
+    return 'smokeSensor';
+  }
+  if (hasAnyPropertyBase(properties, CO_PROPERTY_BASES)) {
+    return 'carbonMonoxideSensor';
+  }
+  if (hasAnyPropertyBase(properties, MOTION_PROPERTY_BASES)) {
+    return 'motionSensor';
+  }
+  if (hasAnyPropertyBase(properties, CONTACT_PROPERTY_BASES)) {
+    return 'contactSensor';
+  }
+  if (hasAnyPropertyBase(properties, AIR_QUALITY_PROPERTY_BASES)) {
+    return 'airQualitySensor';
+  }
+  if (hasAnyPropertyBase(properties, HUMIDITY_PROPERTY_BASES) && !hasAnyPropertyBase(properties, TEMPERATURE_PROPERTY_BASES)) {
+    return 'humiditySensor';
+  }
+  if (hasAnyPropertyBase(properties, TEMPERATURE_PROPERTY_BASES)) {
+    return 'temperatureSensor';
+  }
+  if (hasAnyPropertyBase(properties, BRIGHTNESS_PROPERTY_BASES)) {
+    return 'lightbulb';
+  }
+  if (hasAnyPropertyBase(properties, ONOFF_PROPERTY_BASES)) {
+    return 'switch';
+  }
+  return undefined;
+}
+
+function shouldIgnoreInfrastructureDevice(device: SalusDevice): boolean {
+  return device.model.includes('AG1') || device.model.includes('UG600') || device.model.includes('WZ600');
+}
+
+function dedupeDevicesByDsn(devices: SalusDevice[]): SalusDevice[] {
+  const byDsn = new Map<string, SalusDevice>();
+  for (const device of devices) {
+    byDsn.set(device.dsn, device);
+  }
+  return [...byDsn.values()];
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const workers = Math.max(1, Math.min(concurrency, items.length));
+  const queue = [...items];
+  const results: R[] = [];
+
+  const runner = async () => {
+    for (;;) {
+      const item = queue.shift();
+      if (!item) {
+        return;
+      }
+      const mapped = await mapper(item);
+      results.push(mapped);
+    }
+  };
+
+  await Promise.all(Array.from({ length: workers }, () => runner()));
+  return results;
+}
+
+function asErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+
+function clamp(value: number, minValue: number, maxValue: number): number {
+  return Math.max(minValue, Math.min(maxValue, value));
 }

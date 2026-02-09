@@ -7,7 +7,7 @@
   },
   "description": "HomeBridge HTTP Status Control",
   "plugins": [
-    "homebridge-plugin-name",
+    "homebridge-salus-cloud",
     "homebridge-config-ui-x"
   ],
   "platforms": [
@@ -23,8 +23,10 @@
       "debug": false
     },
     {
-      "name": "homebridge-plugin-name",
-      "platform": "ExampleHomebridgePlugin"
+      "name": "Salus Cloud",
+      "platform": "SalusCloud",
+      "email": "user@example.com",
+      "password": "REPLACE_ME"
     }
   ],
   "accessories": []

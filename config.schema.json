@@ -1,17 +1,147 @@
 {
-  "pluginAlias": "ExampleHomebridgePlugin",
+  "pluginAlias": "SalusCloud",
   "pluginType": "platform",
   "singular": true,
-  "strictValidation": false,
   "schema": {
     "type": "object",
-    "required": ["name"],
+    "required": [
+      "name",
+      "email",
+      "password"
+    ],
     "additionalProperties": false,
     "properties": {
       "name": {
         "title": "Name",
         "type": "string",
-        "default": "Example Dynamic Platform"
+        "default": "Salus Cloud"
+      },
+      "email": {
+        "title": "Salus Email",
+        "type": "string",
+        "format": "email",
+        "placeholder": "name@example.com"
+      },
+      "password": {
+        "title": "Salus Password",
+        "type": "string"
+      },
+      "region": {
+        "title": "Region",
+        "type": "string",
+        "default": "eu",
+        "oneOf": [
+          {
+            "title": "Europe (service-api.eu.premium.salusconnect.io)",
+            "enum": [
+              "eu"
+            ]
+          },
+          {
+            "title": "United States (service-api.us.premium.salusconnect.io)",
+            "enum": [
+              "us"
+            ]
+          }
+        ]
+      },
+      "apiHost": {
+        "title": "Advanced: Custom API Host",
+        "type": "string",
+        "description": "Optional override for Salus service-api host. Use full URL with optional /api/v1 or /api/v2 suffix."
+      },
+      "apiVersionPreference": {
+        "title": "Advanced: API Version Preference",
+        "type": "string",
+        "default": "auto",
+        "oneOf": [
+          {
+            "title": "Auto (try v1 then v2)",
+            "enum": [
+              "auto"
+            ]
+          },
+          {
+            "title": "Prefer v1",
+            "enum": [
+              "v1"
+            ]
+          },
+          {
+            "title": "Prefer v2",
+            "enum": [
+              "v2"
+            ]
+          }
+        ]
+      },
+      "cognitoRegion": {
+        "title": "Advanced: Cognito Region",
+        "type": "string",
+        "default": "eu-central-1",
+        "description": "AWS region used by Salus Cognito authentication endpoint."
+      },
+      "cognitoClientId": {
+        "title": "Advanced: Cognito Client ID",
+        "type": "string",
+        "default": "4pk5efh3v84g5dav43imsv4fbj",
+        "description": "Salus mobile-app Cognito client ID. Change only if Salus changes authentication configuration."
+      },
+      "cognitoUserPoolId": {
+        "title": "Advanced: Cognito User Pool ID",
+        "type": "string",
+        "description": "Optional reference value for diagnostics only."
+      },
+      "companyCode": {
+        "title": "Advanced: Company Code Header",
+        "type": "string",
+        "description": "Optional x-company-code header for partner-branded Salus tenants."
+      },
+      "pollIntervalSeconds": {
+        "title": "Polling Interval (seconds)",
+        "type": "integer",
+        "default": 20,
+        "minimum": 10,
+        "maximum": 300
+      },
+      "requestTimeoutSeconds": {
+        "title": "HTTP Timeout (seconds)",
+        "type": "integer",
+        "default": 30,
+        "minimum": 5,
+        "maximum": 120
+      },
+      "maxRetries": {
+        "title": "HTTP Retries",
+        "type": "integer",
+        "default": 3,
+        "minimum": 0,
+        "maximum": 10
+      },
+      "retryBaseDelayMs": {
+        "title": "Retry Base Delay (milliseconds)",
+        "type": "integer",
+        "default": 750,
+        "minimum": 250,
+        "maximum": 10000
+      },
+      "maxParallelPropertyRequests": {
+        "title": "Parallel Device Property Requests",
+        "type": "integer",
+        "default": 4,
+        "minimum": 1,
+        "maximum": 10
+      },
+      "verboseLogging": {
+        "title": "Verbose Logging",
+        "type": "boolean",
+        "default": false
+      },
+      "allowInsecureTls": {
+        "title": "Allow Insecure TLS",
+        "type": "boolean",
+        "default": false,
+        "description": "Only enable if Salus cloud certificate validation fails (for example CERT_HAS_EXPIRED)."
       }
     }
   }
