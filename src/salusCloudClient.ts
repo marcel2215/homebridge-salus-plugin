@@ -32,6 +32,12 @@ interface CognitoSession {
   companyCode?: string;
 }
 
+interface LegacySession {
+  accessToken: string;
+  tokenType: string;
+  expiresAtEpochMs: number;
+}
+
 interface ShadowRequestVariant {
   method: HttpMethod;
   path: string;
@@ -48,6 +54,7 @@ interface WriteAttempt {
 
 type AuthorizationHeaderProfile = 'accessBearer' | 'idBearer' | 'accessRaw' | 'idRaw';
 type CompanyCodeCandidate = string | null;
+type ApiTransportMode = 'modern' | 'legacy';
 
 class HttpStatusError extends Error {
   constructor(
@@ -69,10 +76,16 @@ const DEFAULT_EU_SERVICE_API_HOST = 'https://service-api.eu.premium.salusconnect
 const DEFAULT_US_SERVICE_API_HOST = 'https://service-api.us.premium.salusconnect.io';
 const FALLBACK_US_SERVICE_API_HOST = 'https://service-api.us.salusconnect.io';
 const FALLBACK_EU_SERVICE_API_HOST = 'https://service-api.eu.salusconnect.io';
+const DEFAULT_EU_LEGACY_API_HOST = 'https://eu.premium.salusconnect.io';
+const DEFAULT_US_LEGACY_API_HOST = 'https://us.premium.salusconnect.io';
+const FALLBACK_US_LEGACY_API_HOST = 'https://us.salusconnect.io';
+const FALLBACK_EU_LEGACY_API_HOST = 'https://eu.salusconnect.io';
 
 const COGNITO_INITIATE_AUTH_TARGET = 'AWSCognitoIdentityProviderService.InitiateAuth';
 const ACCEPT_LANGUAGE = 'en-US,en;q=0.9,en;q=0.8';
 const SESSION_REFRESH_SAFETY_MS = 60_000;
+const LEGACY_SESSION_REFRESH_SAFETY_MS = 60_000;
+const LEGACY_DEFAULT_SESSION_TTL_MS = 45 * 60_000;
 
 const STATUS_ALLOW_PATH_FALLBACK = new Set([404, 405, 426]);
 const STATUS_ALLOW_WRITE_SHAPE_FALLBACK = new Set([400, 404, 405, 409, 415, 422]);
@@ -124,6 +137,7 @@ const METADATA_FIELD_NAMES = new Set([
   'reported',
   'desired',
   'version',
+  'value',
   'gateway',
   'gateway_id',
   'user_id',
@@ -133,6 +147,8 @@ const METADATA_FIELD_NAMES = new Set([
 export class SalusCloudClient {
   private session: CognitoSession | null = null;
   private authRequestInFlight: Promise<void> | null = null;
+  private legacySession: LegacySession | null = null;
+  private legacyAuthRequestInFlight: Promise<void> | null = null;
 
   private readonly requestTimeoutMs: number;
   private readonly maxRetries: number;
@@ -141,6 +157,7 @@ export class SalusCloudClient {
   private readonly allowInsecureTls: boolean;
 
   private readonly serviceApiBaseCandidates: string[];
+  private readonly legacyApiBaseCandidates: string[];
   private readonly cognitoEndpoint: string;
   private readonly cognitoClientId: string;
   private readonly configuredCompanyCode: string | null;
@@ -149,6 +166,9 @@ export class SalusCloudClient {
   private hasWarnedAboutAuthCompanyCode = false;
 
   private activeServiceApiBaseUrl: string | null = null;
+  private activeLegacyApiBaseUrl: string | null = null;
+  private apiTransportMode: ApiTransportMode = 'modern';
+  private hasWarnedAboutLegacyFallback = false;
 
   private readonly propertyCacheByDsn: Map<string, SalusPropertyMap> = new Map();
   private readonly deviceIdToDsn: Map<string, string> = new Map();
@@ -175,6 +195,10 @@ export class SalusCloudClient {
       config.apiHost,
       config.apiVersionPreference,
     );
+    this.legacyApiBaseCandidates = buildLegacyApiBaseCandidates(
+      config.region,
+      config.apiHost,
+    );
 
     const cognitoRegion = normalizeNonEmptyString(config.cognitoRegion) ?? DEFAULT_COGNITO_REGION;
     this.cognitoClientId = normalizeNonEmptyString(config.cognitoClientId) ?? DEFAULT_COGNITO_CLIENT_ID;
@@ -187,16 +211,37 @@ export class SalusCloudClient {
     }
     if (this.verboseLogging) {
       this.log.debug(`Salus service-api candidates: ${this.serviceApiBaseCandidates.join(', ')}`);
+      this.log.debug(`Salus legacy-api candidates: ${this.legacyApiBaseCandidates.join(', ')}`);
       this.log.debug(`Salus Cognito endpoint: ${this.cognitoEndpoint}`);
       this.log.debug(`Salus company-code candidates: ${this.companyCodeCandidates.map((candidate) => candidate ?? '<none>').join(', ')}`);
     }
   }
 
   public getCloudBaseUrl(): string {
+    if (this.apiTransportMode === 'legacy') {
+      return this.activeLegacyApiBaseUrl ?? this.legacyApiBaseCandidates[0]!;
+    }
     return this.activeServiceApiBaseUrl ?? this.serviceApiBaseCandidates[0]!;
   }
 
   public async listDevices(): Promise<SalusDevice[]> {
+    if (this.apiTransportMode === 'legacy') {
+      return await this.listDevicesLegacy();
+    }
+
+    try {
+      return await this.listDevicesModern();
+    } catch (error) {
+      if (!shouldSwitchToLegacyApi(error)) {
+        throw error;
+      }
+
+      this.switchToLegacyTransport(`Modern Salus API authorization failed: ${asErrorMessage(error)}`);
+      return await this.listDevicesLegacy();
+    }
+  }
+
+  private async listDevicesModern(): Promise<SalusDevice[]> {
     const payload = await this.requestServiceJsonWithPathFallback<unknown>(
       ['/devices/', '/devices'],
       {
@@ -233,12 +278,56 @@ export class SalusCloudClient {
     return devices;
   }
 
+  private async listDevicesLegacy(): Promise<SalusDevice[]> {
+    const payload = await this.requestLegacyJsonWithPathFallback<unknown>(
+      ['/apiv1/devices.json', '/apiv1/devices', '/apiv1/registered_nodes.json'],
+      {
+        method: 'GET',
+        auth: true,
+      },
+    );
+
+    const devices = parseDevices(payload);
+    this.rebuildDeviceIndex(devices);
+
+    const inlineShadows = parseDeviceShadows(payload, this.deviceIdToDsn, this.deviceKeyToDsn);
+    if (inlineShadows.size > 0) {
+      this.mergeIntoPropertyCache(inlineShadows);
+      if (this.verboseLogging) {
+        this.log.debug(`Hydrated property cache from legacy /apiv1/devices response for ${inlineShadows.size} device(s)`);
+      }
+    }
+
+    if (this.verboseLogging) {
+      this.log.debug(`Salus legacy cloud returned ${devices.length} device(s)`);
+    }
+
+    return devices;
+  }
+
   public async listProperties(dsn: string): Promise<SalusPropertyMap> {
     const cached = this.propertyCacheByDsn.get(dsn);
     if (cached) {
       return cached;
     }
 
+    if (this.apiTransportMode === 'legacy') {
+      return await this.listPropertiesLegacy(dsn);
+    }
+
+    try {
+      return await this.listPropertiesModern(dsn);
+    } catch (error) {
+      if (!shouldSwitchToLegacyApi(error)) {
+        throw error;
+      }
+
+      this.switchToLegacyTransport(`Modern Salus property sync failed for ${dsn}: ${asErrorMessage(error)}`);
+      return await this.listPropertiesLegacy(dsn);
+    }
+  }
+
+  private async listPropertiesModern(dsn: string): Promise<SalusPropertyMap> {
     const shadows = await this.fetchDeviceShadows([], [dsn]);
     const fromFetch = shadows.get(dsn);
     if (fromFetch) {
@@ -253,7 +342,52 @@ export class SalusCloudClient {
     return new Map();
   }
 
+  private async listPropertiesLegacy(dsn: string): Promise<SalusPropertyMap> {
+    const encodedDsn = encodeURIComponent(dsn);
+    const payload = await this.requestLegacyJsonWithPathFallback<unknown>(
+      [
+        `/apiv1/dsns/${encodedDsn}/properties.json`,
+        `/apiv1/dsns/${encodedDsn}/properties`,
+      ],
+      {
+        method: 'GET',
+        auth: true,
+      },
+    );
+
+    const parsed = parseProperties(payload);
+    if (parsed.size > 0) {
+      this.propertyCacheByDsn.set(dsn, parsed);
+      return parsed;
+    }
+
+    if (this.verboseLogging) {
+      this.log.debug(`No legacy cloud property payload found for dsn=${dsn}. Returning empty property map.`);
+    }
+
+    return new Map();
+  }
+
   public async setDatapoint(dsn: string, propertyName: string, value: unknown): Promise<void> {
+    if (this.apiTransportMode === 'legacy') {
+      await this.setDatapointLegacy(dsn, propertyName, value);
+      return;
+    }
+
+    try {
+      await this.setDatapointModern(dsn, propertyName, value);
+      return;
+    } catch (error) {
+      if (!shouldSwitchToLegacyApi(error)) {
+        throw error;
+      }
+
+      this.switchToLegacyTransport(`Modern Salus datapoint write failed for ${dsn}/${propertyName}: ${asErrorMessage(error)}`);
+      await this.setDatapointLegacy(dsn, propertyName, value);
+    }
+  }
+
+  private async setDatapointModern(dsn: string, propertyName: string, value: unknown): Promise<void> {
     const writeCacheKey = `${dsn}:${propertyName}`;
     const preferredAttempt = this.preferredWriteAttemptByKey.get(writeCacheKey) ?? null;
     const attempts = prioritizeByDescription(this.buildWriteAttempts(dsn, propertyName, value), preferredAttempt);
@@ -302,6 +436,113 @@ export class SalusCloudClient {
       );
     }
     throw new Error(`Failed to write property ${propertyName} on ${dsn}. Attempts: ${failures.join(' | ')}`);
+  }
+
+  private async setDatapointLegacy(dsn: string, propertyName: string, value: unknown): Promise<void> {
+    const encodedDsn = encodeURIComponent(dsn);
+    const encodedPropertyName = encodeURIComponent(propertyName);
+
+    const attempts: WriteAttempt[] = [
+      {
+        method: 'POST',
+        path: `/apiv1/dsns/${encodedDsn}/properties/${encodedPropertyName}/datapoints.json`,
+        body: {
+          datapoint: {
+            value,
+          },
+        },
+        description: 'POST /apiv1/dsns/{dsn}/properties/{property}/datapoints.json {datapoint:{value}}',
+      },
+      {
+        method: 'POST',
+        path: `/apiv1/dsns/${encodedDsn}/properties/${encodedPropertyName}/datapoints`,
+        body: {
+          datapoint: {
+            value,
+          },
+        },
+        description: 'POST /apiv1/dsns/{dsn}/properties/{property}/datapoints {datapoint:{value}}',
+      },
+      {
+        method: 'PUT',
+        path: `/apiv1/dsns/${encodedDsn}/properties/${encodedPropertyName}/datapoints.json`,
+        body: {
+          datapoint: {
+            value,
+          },
+        },
+        description: 'PUT /apiv1/dsns/{dsn}/properties/{property}/datapoints.json {datapoint:{value}}',
+      },
+      {
+        method: 'POST',
+        path: `/apiv1/dsns/${encodedDsn}/properties/${encodedPropertyName}/datapoints.json`,
+        body: {
+          value,
+        },
+        description: 'POST /apiv1/dsns/{dsn}/properties/{property}/datapoints.json {value}',
+      },
+    ];
+
+    const failures: string[] = [];
+    let fatalError: unknown;
+
+    for (const attempt of attempts) {
+      try {
+        await this.requestLegacyJson(attempt.path, {
+          method: attempt.method,
+          body: attempt.body,
+          auth: true,
+          expectedStatuses: DEFAULT_EXPECTED_STATUSES,
+        });
+
+        this.updateCachedProperty(dsn, propertyName, value);
+        if (this.verboseLogging) {
+          this.log.debug(`Legacy write succeeded via ${attempt.description}`);
+        }
+        return;
+      } catch (error) {
+        const failureMessage = error instanceof HttpStatusError
+          ? `${attempt.description} -> HTTP ${error.status}`
+          : `${attempt.description} -> ${asErrorMessage(error)}`;
+        failures.push(failureMessage);
+
+        if (error instanceof HttpStatusError && STATUS_ALLOW_WRITE_SHAPE_FALLBACK.has(error.status)) {
+          continue;
+        }
+        if (error instanceof HttpStatusError && STATUS_ALLOW_PATH_FALLBACK.has(error.status)) {
+          continue;
+        }
+
+        fatalError = error;
+        break;
+      }
+    }
+
+    if (fatalError) {
+      throw new Error(
+        `Failed to write property ${propertyName} on ${dsn} via legacy API. Fatal error: ${asErrorMessage(fatalError)}. Attempts: ${failures.join(' | ')}`,
+      );
+    }
+    throw new Error(`Failed to write property ${propertyName} on ${dsn} via legacy API. Attempts: ${failures.join(' | ')}`);
+  }
+
+  private switchToLegacyTransport(reason: string): void {
+    if (this.apiTransportMode === 'legacy') {
+      return;
+    }
+
+    this.apiTransportMode = 'legacy';
+    this.activeServiceApiBaseUrl = null;
+    this.authorizationHeaderProfile = 'accessBearer';
+    this.session = null;
+    this.authRequestInFlight = null;
+    this.hasWarnedAboutAuthCompanyCode = false;
+
+    if (!this.hasWarnedAboutLegacyFallback) {
+      this.hasWarnedAboutLegacyFallback = true;
+      this.log.warn(`Switching to legacy Salus cloud compatibility mode (${reason})`);
+      this.log.warn('Legacy mode uses /users/sign_in.json and /apiv1 endpoints for tenant compatibility.');
+    }
   }
 
   private rememberPreferredWriteAttempt(cacheKey: string, description: string): void {
@@ -740,6 +981,141 @@ export class SalusCloudClient {
     }
   }
 
+  private async ensureLegacyLoggedIn(): Promise<void> {
+    if (this.legacySession && Date.now() + LEGACY_SESSION_REFRESH_SAFETY_MS < this.legacySession.expiresAtEpochMs) {
+      return;
+    }
+
+    await this.loginLegacy();
+  }
+
+  private async loginLegacy(): Promise<void> {
+    if (this.legacyAuthRequestInFlight) {
+      return this.legacyAuthRequestInFlight;
+    }
+
+    this.legacyAuthRequestInFlight = (async () => {
+      this.legacySession = await this.authenticateLegacyWithPassword();
+      this.log.info('Authenticated with Salus cloud (legacy API compatibility mode)');
+    })();
+
+    try {
+      await this.legacyAuthRequestInFlight;
+    } finally {
+      this.legacyAuthRequestInFlight = null;
+    }
+  }
+
+  private async authenticateLegacyWithPassword(): Promise<LegacySession> {
+    const email = this.config.email?.trim();
+    const password = this.config.password;
+    if (!email || !password) {
+      throw new Error('Salus credentials are missing. Set email and password in plugin config.');
+    }
+
+    const totalAttempts = this.maxRetries + 1;
+    let lastError: unknown = new Error('Legacy Salus login did not return a session');
+
+    for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+      const orderedBaseUrls = this.getOrderedLegacyApiBaseUrls();
+      let sawRetriableFailure = false;
+      let sawDefinitiveFailure = false;
+      let definitiveError: unknown;
+
+      for (const baseUrl of orderedBaseUrls) {
+        try {
+          const response = await this.fetchWithTimeout(
+            buildLegacyUrl(baseUrl, '/users/sign_in.json', true),
+            {
+              method: 'POST',
+              headers: {
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+                'Accept-Language': ACCEPT_LANGUAGE,
+                'User-Agent': 'homebridge-salus-cloud/2026',
+              },
+              body: JSON.stringify({
+                user: {
+                  email,
+                  password,
+                },
+              }),
+            },
+          );
+
+          if (!response.ok) {
+            const responseText = await safeReadText(response);
+            const statusError = new HttpStatusError(
+              responseText
+                ? `Legacy Salus login failed at ${baseUrl} (HTTP ${response.status}) :: ${responseText}`
+                : `Legacy Salus login failed at ${baseUrl} (HTTP ${response.status})`,
+              response.status,
+              responseText,
+            );
+
+            if (isRetriableStatus(response.status)) {
+              lastError = statusError;
+              sawRetriableFailure = true;
+              continue;
+            }
+
+            sawDefinitiveFailure = true;
+            if (!definitiveError) {
+              definitiveError = statusError;
+            }
+            lastError = statusError;
+            continue;
+          }
+
+          const payload = await parseResponseBody<unknown>(response);
+          const session = parseLegacyTokens(payload);
+          if (!session) {
+            const parseError = new Error(`Legacy Salus login succeeded at ${baseUrl}, but access token was missing in response.`);
+            sawDefinitiveFailure = true;
+            if (!definitiveError) {
+              definitiveError = parseError;
+            }
+            lastError = parseError;
+            continue;
+          }
+
+          this.activeLegacyApiBaseUrl = baseUrl;
+          return session;
+        } catch (error) {
+          if (!this.allowInsecureTls && isTlsCertificateError(error)) {
+            const message = `${asErrorMessage(error)}. If Salus cloud certificate is invalid, set "allowInsecureTls": true in plugin config.`;
+            throw new Error(message);
+          }
+
+          if (isRetriableFailure(error)) {
+            sawRetriableFailure = true;
+            lastError = error;
+            continue;
+          }
+
+          sawDefinitiveFailure = true;
+          if (!definitiveError) {
+            definitiveError = error;
+          }
+          lastError = error;
+        }
+      }
+
+      if (sawDefinitiveFailure) {
+        throw definitiveError ?? lastError;
+      }
+
+      if (attempt < totalAttempts && sawRetriableFailure) {
+        await this.retryDelay(attempt, asErrorMessage(lastError));
+        continue;
+      }
+
+      break;
+    }
+
+    throw new Error(`Legacy Salus login failed after retries: ${asErrorMessage(lastError)}`);
+  }
+
   private async authenticateWithPassword(): Promise<CognitoSession> {
     const email = this.config.email?.trim();
     const password = this.config.password;
@@ -855,6 +1231,28 @@ export class SalusCloudClient {
     }
 
     throw new Error(`No valid path candidates for request: ${paths.join(', ')}`);
+  }
+
+  private async requestLegacyJsonWithPathFallback<T>(paths: string[], options: RequestOptions): Promise<T> {
+    let lastPathError: unknown;
+
+    for (const path of paths) {
+      try {
+        return await this.requestLegacyJson<T>(path, options);
+      } catch (error) {
+        if (error instanceof HttpStatusError && STATUS_ALLOW_PATH_FALLBACK.has(error.status)) {
+          lastPathError = error;
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    if (lastPathError) {
+      throw lastPathError;
+    }
+
+    throw new Error(`No valid legacy path candidates for request: ${paths.join(', ')}`);
   }
 
   private async requestServiceJson<T>(path: string, options: RequestOptions): Promise<T> {
@@ -1046,6 +1444,155 @@ export class SalusCloudClient {
     throw new Error(`Unexpected request state for ${options.method} ${path}`);
   }
 
+  private async requestLegacyJson<T>(path: string, options: RequestOptions): Promise<T> {
+    const authRequired = options.auth ?? true;
+    if (authRequired) {
+      await this.ensureLegacyLoggedIn();
+    }
+
+    const expectedStatuses = options.expectedStatuses ?? DEFAULT_EXPECTED_STATUSES;
+    const totalAttempts = this.maxRetries + 1;
+    let hasRefreshedSessionAfter401 = false;
+    let lastError: unknown = new Error(`No legacy Salus cloud response received for ${options.method} ${path}`);
+
+    for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+      const orderedBaseUrls = this.getOrderedLegacyApiBaseUrls();
+      let sawRetriableFailure = false;
+      let sawDefinitiveFailure = false;
+      let definitiveError: unknown;
+      let lastRetriableError: unknown;
+
+      for (const baseUrl of orderedBaseUrls) {
+        try {
+          const headers = this.buildLegacyHeaders(authRequired);
+          const body = options.body !== undefined ? JSON.stringify(options.body) : undefined;
+          if (body !== undefined) {
+            headers['Content-Type'] = 'application/json';
+          }
+
+          const response = await this.fetchWithTimeout(
+            buildLegacyUrl(baseUrl, path, options.method === 'GET'),
+            {
+              method: options.method,
+              headers,
+              body,
+            },
+          );
+
+          if (response.status === 401 && authRequired) {
+            const responseText = await safeReadText(response);
+            if ((options.allow401Refresh ?? true) && !hasRefreshedSessionAfter401) {
+              hasRefreshedSessionAfter401 = true;
+              this.log.warn(`Legacy Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}. Re-authenticating and retrying.`);
+              this.legacySession = null;
+              await this.loginLegacy();
+              lastError = new HttpStatusError('Unauthorized', 401, responseText);
+              sawRetriableFailure = true;
+              lastRetriableError = lastError;
+              continue;
+            }
+
+            const unauthorizedError = new HttpStatusError(
+              responseText
+                ? `HTTP 401 Unauthorized on legacy ${options.method} ${path} via ${baseUrl} :: ${responseText}`
+                : `HTTP 401 Unauthorized on legacy ${options.method} ${path} via ${baseUrl}`,
+              401,
+              responseText,
+            );
+            lastError = unauthorizedError;
+            sawRetriableFailure = true;
+            lastRetriableError = unauthorizedError;
+            continue;
+          }
+
+          if (!expectedStatuses.includes(response.status)) {
+            const responseText = await safeReadText(response);
+            const statusError = new HttpStatusError(
+              responseText
+                ? `Legacy API HTTP ${response.status} ${response.statusText} on ${options.method} ${path} :: ${responseText}`
+                : `Legacy API HTTP ${response.status} ${response.statusText} on ${options.method} ${path}`,
+              response.status,
+              responseText,
+            );
+
+            if (STATUS_ALLOW_PATH_FALLBACK.has(response.status)) {
+              lastError = statusError;
+              continue;
+            }
+
+            if (isRetriableStatus(response.status)) {
+              lastError = statusError;
+              sawRetriableFailure = true;
+              lastRetriableError = statusError;
+              continue;
+            }
+
+            lastError = statusError;
+            sawDefinitiveFailure = true;
+            if (!definitiveError) {
+              definitiveError = statusError;
+            }
+            continue;
+          }
+
+          this.activeLegacyApiBaseUrl = baseUrl;
+
+          if (response.status === 204) {
+            return undefined as T;
+          }
+
+          return await parseResponseBody<T>(response);
+        } catch (error) {
+          if (!this.allowInsecureTls && isTlsCertificateError(error)) {
+            const message = `${asErrorMessage(error)}. If Salus cloud certificate is invalid, set "allowInsecureTls": true in plugin config.`;
+            throw new Error(message);
+          }
+
+          if (error instanceof HttpStatusError) {
+            lastError = error;
+            if (isRetriableStatus(error.status)) {
+              sawRetriableFailure = true;
+              lastRetriableError = error;
+            } else if (!STATUS_ALLOW_PATH_FALLBACK.has(error.status)) {
+              sawDefinitiveFailure = true;
+              if (!definitiveError) {
+                definitiveError = error;
+              }
+            }
+            continue;
+          }
+
+          if (isRetriableError(error)) {
+            lastError = error;
+            sawRetriableFailure = true;
+            lastRetriableError = error;
+            if (this.verboseLogging) {
+              this.log.debug(`Retriable legacy network error for ${options.method} ${path} via ${baseUrl}: ${asErrorMessage(error)}`);
+            }
+            continue;
+          }
+
+          throw error;
+        }
+      }
+
+      if (sawDefinitiveFailure) {
+        throw definitiveError ?? lastError;
+      }
+
+      if (attempt < totalAttempts && sawRetriableFailure) {
+        await this.retryDelay(attempt, asErrorMessage(lastRetriableError ?? lastError));
+        continue;
+      }
+
+      if (lastError) {
+        throw lastError;
+      }
+    }
+
+    throw new Error(`Unexpected legacy request state for ${options.method} ${path}`);
+  }
+
   private buildServiceHeaders(authRequired: boolean): Record<string, string> {
     const headers: Record<string, string> = {
       Accept: 'application/json',
@@ -1073,6 +1620,26 @@ export class SalusCloudClient {
     return headers;
   }
 
+  private buildLegacyHeaders(authRequired: boolean): Record<string, string> {
+    const headers: Record<string, string> = {
+      Accept: 'application/json',
+      'Accept-Language': ACCEPT_LANGUAGE,
+      'User-Agent': 'homebridge-salus-cloud/2026',
+    };
+
+    if (!authRequired) {
+      return headers;
+    }
+
+    if (!this.legacySession) {
+      throw new Error('Missing Salus legacy session while building authenticated request.');
+    }
+
+    const tokenType = normalizeNonEmptyString(this.legacySession.tokenType) ?? 'Bearer';
+    headers.Authorization = `${tokenType} ${this.legacySession.accessToken}`;
+    return headers;
+  }
+
   private getOrderedServiceApiBaseUrls(): string[] {
     const dedupe = new Set<string>();
     const ordered: string[] = [];
@@ -1083,6 +1650,26 @@ export class SalusCloudClient {
     }
 
     for (const candidate of this.serviceApiBaseCandidates) {
+      if (dedupe.has(candidate)) {
+        continue;
+      }
+      dedupe.add(candidate);
+      ordered.push(candidate);
+    }
+
+    return ordered;
+  }
+
+  private getOrderedLegacyApiBaseUrls(): string[] {
+    const dedupe = new Set<string>();
+    const ordered: string[] = [];
+
+    if (this.activeLegacyApiBaseUrl) {
+      dedupe.add(this.activeLegacyApiBaseUrl);
+      ordered.push(this.activeLegacyApiBaseUrl);
+    }
+
+    for (const candidate of this.legacyApiBaseCandidates) {
       if (dedupe.has(candidate)) {
         continue;
       }
@@ -1172,6 +1759,68 @@ function buildServiceApiBaseCandidates(
   return dedupeStringArray(hosts.flatMap((host) => buildApiVersionCandidates(host, versionPreference)));
 }
 
+function buildLegacyApiBaseCandidates(
+  region: SalusRegion | undefined,
+  overrideHost: string | undefined,
+): string[] {
+  const normalizedOverride = normalizeNonEmptyString(overrideHost);
+  if (normalizedOverride) {
+    const overrideCandidates = deriveLegacyHostCandidatesFromOverride(normalizedOverride);
+    if (overrideCandidates.length > 0) {
+      const withFallback = [
+        ...overrideCandidates,
+        ...(region === 'us'
+          ? [DEFAULT_US_LEGACY_API_HOST, FALLBACK_US_LEGACY_API_HOST, DEFAULT_EU_LEGACY_API_HOST, FALLBACK_EU_LEGACY_API_HOST]
+          : [DEFAULT_EU_LEGACY_API_HOST, FALLBACK_EU_LEGACY_API_HOST, DEFAULT_US_LEGACY_API_HOST, FALLBACK_US_LEGACY_API_HOST]),
+      ];
+      return dedupeStringArray(withFallback.map((value) => normalizeUrl(value)));
+    }
+  }
+
+  const hosts = region === 'us'
+    ? [
+      DEFAULT_US_LEGACY_API_HOST,
+      FALLBACK_US_LEGACY_API_HOST,
+      DEFAULT_EU_LEGACY_API_HOST,
+      FALLBACK_EU_LEGACY_API_HOST,
+    ]
+    : [
+      DEFAULT_EU_LEGACY_API_HOST,
+      FALLBACK_EU_LEGACY_API_HOST,
+      DEFAULT_US_LEGACY_API_HOST,
+      FALLBACK_US_LEGACY_API_HOST,
+    ];
+
+  return dedupeStringArray(hosts.map((value) => normalizeUrl(value)));
+}
+
+function deriveLegacyHostCandidatesFromOverride(overrideHost: string): string[] {
+  const normalizedOverride = normalizeUrl(overrideHost);
+  const candidates = new Set<string>();
+
+  try {
+    const parsed = new URL(normalizedOverride);
+    const hostname = parsed.hostname.toLowerCase();
+    const protocol = parsed.protocol;
+
+    candidates.add(`${protocol}//${hostname}`);
+    if (hostname.startsWith('service-api.')) {
+      candidates.add(`${protocol}//${hostname.replace(/^service-api\./, '')}`);
+    }
+  } catch {
+    // Keep best-effort fallback.
+    candidates.add(normalizedOverride.replace(/\/api\/v[12](?:\/.*)?$/i, '').replace(/\/+$/, ''));
+    candidates.add(
+      normalizedOverride
+        .replace(/\/api\/v[12](?:\/.*)?$/i, '')
+        .replace(/\/+$/, '')
+        .replace(/:\/\/service-api\./i, '://'),
+    );
+  }
+
+  return [...candidates].filter((value) => value.trim() !== '');
+}
+
 function buildApiVersionCandidates(baseHost: string, preference: SalusApiVersionPreference | undefined): string[] {
   const normalized = normalizeUrl(baseHost).replace(/\/+$/, '');
 
@@ -1198,6 +1847,12 @@ function dedupeStringArray(values: string[]): string[] {
 }
 
 function buildServiceUrl(baseUrl: string, path: string, addTimestamp: boolean): string {
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  const joined = `${baseUrl}${normalizedPath}`;
+  return addTimestamp ? withTimestampQuery(joined) : joined;
+}
+
+function buildLegacyUrl(baseUrl: string, path: string, addTimestamp: boolean): string {
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
   const joined = `${baseUrl}${normalizedPath}`;
   return addTimestamp ? withTimestampQuery(joined) : joined;
@@ -1352,6 +2007,48 @@ function parseCognitoTokens(payload: unknown, refreshTokenFallback?: string): Co
   };
 }
 
+function parseLegacyTokens(payload: unknown): LegacySession | undefined {
+  const root = asRecord(payload);
+  if (!root) {
+    return undefined;
+  }
+
+  const valueRecord = asRecord(root.value);
+  const candidateRecords = [
+    root,
+    valueRecord,
+    asRecord(root.user),
+    valueRecord ? asRecord(valueRecord.user) : undefined,
+  ].filter((value): value is Record<string, unknown> => Boolean(value));
+
+  for (const candidate of candidateRecords) {
+    const accessToken = normalizeNonEmptyString(
+      asString(candidate.access_token)
+      ?? asString(candidate.accessToken)
+      ?? asString(candidate.token)
+      ?? asString(candidate.auth_token)
+      ?? asString(candidate.bearer_token),
+    );
+    if (!accessToken) {
+      continue;
+    }
+
+    const tokenType = normalizeNonEmptyString(asString(candidate.token_type) ?? asString(candidate.tokenType)) ?? 'Bearer';
+    const expiresInRaw = parseNumberLike(candidate.expires_in ?? candidate.expiresIn ?? candidate.expired_in);
+    const expiresInMs = Number.isFinite(expiresInRaw)
+      ? Math.max(60_000, Math.floor(Number(expiresInRaw) * 1_000))
+      : LEGACY_DEFAULT_SESSION_TTL_MS;
+
+    return {
+      accessToken,
+      tokenType,
+      expiresAtEpochMs: Date.now() + expiresInMs,
+    };
+  }
+
+  return undefined;
+}
+
 function formatAuthorizationHeader(
   profile: AuthorizationHeaderProfile,
   accessToken: string,
@@ -1464,7 +2161,7 @@ function parseDevices(payload: unknown): SalusDevice[] {
   }
 
   if (root) {
-    const arrayKeys = ['devices', 'registered_nodes', 'nodes', 'results', 'data', 'list', 'device_list'];
+    const arrayKeys = ['devices', 'registered_nodes', 'nodes', 'results', 'data', 'list', 'device_list', 'value'];
     for (const key of arrayKeys) {
       const arr = asArray(root[key]);
       if (arr) {
@@ -1653,19 +2350,35 @@ function parseProperties(payload: unknown): SalusPropertyMap {
 
   const root = asRecord(payload);
   const candidateArrays: unknown[][] = [];
+  const candidateSingles: unknown[] = [];
 
   if (Array.isArray(payload)) {
     candidateArrays.push(payload);
   }
 
   if (root) {
-    const keys = ['properties', 'property', 'data', 'results', 'datapoints', 'list'];
+    const keys = ['properties', 'property', 'data', 'results', 'datapoints', 'list', 'value'];
     for (const key of keys) {
       const maybeArray = asArray(root[key]);
       if (maybeArray) {
         candidateArrays.push(maybeArray);
       }
     }
+
+    const valueRecord = asRecord(root.value);
+    if (valueRecord) {
+      candidateSingles.push(valueRecord);
+
+      const nestedArrayKeys = ['properties', 'property', 'data', 'results', 'datapoints', 'list'];
+      for (const key of nestedArrayKeys) {
+        const nestedArray = asArray(valueRecord[key]);
+        if (nestedArray) {
+          candidateArrays.push(nestedArray);
+        }
+      }
+    }
+
+    candidateSingles.push(root);
   }
 
   for (const entries of candidateArrays) {
@@ -1677,8 +2390,19 @@ function parseProperties(payload: unknown): SalusPropertyMap {
     }
   }
 
-  if (root) {
-    parsePropertyObjectMap(root, result);
+  for (const candidate of candidateSingles) {
+    const property = parsePropertyEntry(candidate);
+    if (property) {
+      result.set(property.name, property);
+    }
+  }
+
+  for (const candidate of candidateSingles) {
+    const record = asRecord(candidate);
+    if (!record) {
+      continue;
+    }
+    parsePropertyObjectMap(record, result);
   }
 
   return result;
@@ -1944,6 +2668,26 @@ function isRetriableFailure(error: unknown): boolean {
     return isRetriableStatus(error.status);
   }
   return isRetriableError(error);
+}
+
+function shouldSwitchToLegacyApi(error: unknown): boolean {
+  if (!(error instanceof HttpStatusError)) {
+    return false;
+  }
+
+  if (error.status === 401 || error.status === 403) {
+    const responseCode = extractServiceResponseCode(error.responseBody);
+    if (responseCode === '900008') {
+      return true;
+    }
+
+    const body = error.responseBody.toLowerCase();
+    if (body.includes('not authorized') || body.includes('unauthorized')) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function isRetriableStatus(status: number): boolean {

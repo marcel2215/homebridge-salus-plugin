@@ -94,10 +94,18 @@ Examples:
 - Automatic token refresh before expiry and on `401` responses.
 - Exponential backoff retries for transient network/API failures.
 - API base fallback between `/api/v1` and `/api/v2`.
+- Automatic compatibility fallback to legacy Salus cloud auth/API (`/users/sign_in.json` + `/apiv1`) when modern API returns persistent authorization errors (for example `response_code=900008`).
 - Flexible shadow parser for multiple payload shapes.
 - Flexible write payload fallback for service-api compatibility changes.
 - Immediate short re-poll after write to keep HomeKit state aligned.
 - Detailed logs for auth, discovery, shadow sync, writes, retries, and failures.
+
+## 900008 troubleshooting
+
+If logs show `response_code=900008` from modern `service-api`, this plugin now auto-switches into legacy compatibility mode and retries using the older Salus cloud stack. You will see:
+
+- `Switching to legacy Salus cloud compatibility mode (...)`
+- `Authenticated with Salus cloud (legacy API compatibility mode)`
 
 ## Salus features not cleanly mappable to HomeKit
 
