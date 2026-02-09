@@ -184,6 +184,27 @@ export const MODEL_CATALOG: Record<string, ModelCatalogEntry> = {
   'ZG9101SAC_HP': { model: 'ZG9101SAC_HP', layout: 'ac_phase_cut_zigbee_dimmers', categoryId: '19', categoryName: 'AC Phase Cut ZigBee Dimmers' },
 };
 
+function canonicalizeModelKey(model: string): string {
+  return model
+    .trim()
+    .replaceAll(/[^A-Za-z0-9]/g, '_')
+    .replaceAll(/_+/g, '_')
+    .replaceAll(/^_+|_+$/g, '')
+    .toUpperCase();
+}
+
+const MODEL_CATALOG_BY_CANONICAL_KEY: Map<string, ModelCatalogEntry> = new Map(
+  Object.values(MODEL_CATALOG).map((entry) => [canonicalizeModelKey(entry.model), entry]),
+);
+
+function resolveCatalogEntry(model: string): ModelCatalogEntry | undefined {
+  const direct = MODEL_CATALOG[model];
+  if (direct) {
+    return direct;
+  }
+  return MODEL_CATALOG_BY_CANONICAL_KEY.get(canonicalizeModelKey(model));
+}
+
 const THERMOSTAT_CATEGORY_IDS = new Set(['12', '13', '15', '32', '38', '47', '202', '205', '208', '210']);
 const SWITCH_CATEGORY_IDS = new Set(['4', '7', '8', '28', '33', '34', '37', '45', '46', '203', '206', '207']);
 const LIGHT_CATEGORY_IDS = new Set(['14', '19', '27']);
@@ -191,14 +212,16 @@ const CONTACT_CATEGORY_IDS = new Set(['9', '24']);
 const MOTION_CATEGORY_IDS = new Set(['18']);
 const LEAK_CATEGORY_IDS = new Set(['5']);
 const SMOKE_CATEGORY_IDS = new Set(['23', '209']);
-const CO_CATEGORY_IDS = new Set(['6']);
+// Category 6 is "Wireless Uncontrollable Devices" and includes repeaters/buttons,
+// so carbon-monoxide must be inferred from live properties instead of category id.
+const CO_CATEGORY_IDS = new Set<string>();
 const LOCK_CATEGORY_IDS = new Set(['300']);
 const VALVE_CATEGORY_IDS = new Set(['201']);
 const WINDOW_COVERING_CATEGORY_IDS = new Set(['30']);
-const TEMP_SENSOR_CATEGORY_IDS = new Set(['20', '21']);
+const TEMP_SENSOR_CATEGORY_IDS = new Set(['20']);
 
 export function inferKindFromCatalog(model: string): HomeKitDeviceKind | undefined {
-  const entry = MODEL_CATALOG[model];
+  const entry = resolveCatalogEntry(model);
   if (!entry) {
     return undefined;
   }
@@ -245,5 +268,5 @@ export function inferKindFromCatalog(model: string): HomeKitDeviceKind | undefin
 }
 
 export function getCatalogEntry(model: string): ModelCatalogEntry | undefined {
-  return MODEL_CATALOG[model];
+  return resolveCatalogEntry(model);
 }

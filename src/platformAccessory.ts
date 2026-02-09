@@ -5,6 +5,7 @@ import type { CharacteristicValue, PlatformAccessory, Service } from 'homebridge
 import type { HomeKitDeviceKind } from './deviceCatalog.js';
 import {
   clamp,
+  encodeBooleanLike,
   encodePercentageLike,
   findPropertyByBaseName,
   getBooleanProperty,
@@ -572,27 +573,53 @@ export class SalusPlatformAccessory {
   }
 
   private async setTargetTemperature(value: CharacteristicValue): Promise<void> {
-    const targetTemperature = clamp(Number(value), 4.5, 35);
+    const numericValue = parseCharacteristicNumber(value);
+    if (numericValue === undefined) {
+      throw this.communicationFailure('Received invalid thermostat target temperature value from HomeKit');
+    }
+
+    const targetTemperature = clamp(numericValue, 4.5, 35);
     const scaled = Math.round(targetTemperature * 100);
     const targetState = this.cachedTargetState;
 
     const writes: Array<{ property: string; value: unknown }> = [];
+    const queuedProperties = new Set<string>();
+    const pickFirstProperty = (candidates: Array<string | undefined>): string | undefined => {
+      for (const candidate of candidates) {
+        if (candidate) {
+          return candidate;
+        }
+      }
+      return undefined;
+    };
+    const enqueueWrite = (property: string | undefined) => {
+      if (!property || queuedProperties.has(property)) {
+        return;
+      }
+      queuedProperties.add(property);
+      writes.push({ property, value: scaled });
+    };
 
     if (targetState === this.platform.Characteristic.TargetHeatingCoolingState.COOL) {
-      if (this.writeTargets.coolSetpoint) {
-        writes.push({ property: this.writeTargets.coolSetpoint, value: scaled });
-      }
+      enqueueWrite(
+        pickFirstProperty([
+          this.writeTargets.coolSetpoint,
+          this.writeTargets.autoCoolSetpoint,
+          this.writeTargets.heatSetpoint,
+        ]),
+      );
     } else if (targetState === this.platform.Characteristic.TargetHeatingCoolingState.AUTO) {
-      if (this.writeTargets.autoHeatSetpoint) {
-        writes.push({ property: this.writeTargets.autoHeatSetpoint, value: scaled });
-      }
-      if (this.writeTargets.autoCoolSetpoint) {
-        writes.push({ property: this.writeTargets.autoCoolSetpoint, value: scaled });
-      }
-    } else if (targetState === this.platform.Characteristic.TargetHeatingCoolingState.HEAT) {
-      if (this.writeTargets.heatSetpoint) {
-        writes.push({ property: this.writeTargets.heatSetpoint, value: scaled });
-      }
+      enqueueWrite(pickFirstProperty([this.writeTargets.autoHeatSetpoint, this.writeTargets.heatSetpoint]));
+      enqueueWrite(pickFirstProperty([this.writeTargets.autoCoolSetpoint, this.writeTargets.coolSetpoint]));
+    } else {
+      enqueueWrite(
+        pickFirstProperty([
+          this.writeTargets.heatSetpoint,
+          this.writeTargets.autoHeatSetpoint,
+          this.writeTargets.coolSetpoint,
+          this.writeTargets.autoCoolSetpoint,
+        ]),
+      );
     }
 
     if (writes.length === 0) {
@@ -606,7 +633,11 @@ export class SalusPlatformAccessory {
   }
 
   private async setTargetHeatingCoolingState(value: CharacteristicValue): Promise<void> {
-    const hkState = Number(value) as number;
+    const hkStateRaw = parseCharacteristicNumber(value);
+    if (hkStateRaw === undefined) {
+      throw this.communicationFailure('Received invalid thermostat mode value from HomeKit');
+    }
+    const hkState = Math.round(hkStateRaw);
     let mode = SALUS_MODE.auto;
     if (hkState === this.platform.Characteristic.TargetHeatingCoolingState.OFF) {
       mode = SALUS_MODE.off;
@@ -619,10 +650,23 @@ export class SalusPlatformAccessory {
     if (!this.writeTargets.systemMode) {
       throw this.communicationFailure('No writable system mode property was discovered');
     }
+
+    const holdTypeCurrent = getNumberProperty(this.latestProperties, THERMOSTAT_HOLD_TYPE);
+    if (mode !== SALUS_MODE.off && this.writeTargets.holdType && holdTypeCurrent !== undefined && Math.round(holdTypeCurrent) === 7) {
+      try {
+        await this.platform.writeDeviceProperty(this.device, this.writeTargets.holdType, 0);
+      } catch (error) {
+        this.platform.log.warn(`Unable to clear thermostat hold type for ${this.device.name}: ${asErrorMessage(error)}`);
+      }
+    }
     await this.platform.writeDeviceProperty(this.device, this.writeTargets.systemMode, mode);
 
     if (mode === SALUS_MODE.off && this.writeTargets.holdType) {
-      await this.platform.writeDeviceProperty(this.device, this.writeTargets.holdType, 7);
+      try {
+        await this.platform.writeDeviceProperty(this.device, this.writeTargets.holdType, 7);
+      } catch (error) {
+        this.platform.log.warn(`Unable to apply thermostat off hold for ${this.device.name}: ${asErrorMessage(error)}`);
+      }
     }
 
     this.cachedTargetState = hkState;
@@ -631,7 +675,10 @@ export class SalusPlatformAccessory {
   }
 
   private async setOnOff(value: CharacteristicValue): Promise<void> {
-    const on = Boolean(value);
+    const on = parseCharacteristicBoolean(value);
+    if (on === undefined) {
+      throw this.communicationFailure('Received invalid On/Off value from HomeKit');
+    }
     const property = this.writeTargets.onOff ?? this.writeTargets.brightness;
     if (!property) {
       throw this.communicationFailure('No writable On/Off property was discovered');
@@ -642,12 +689,18 @@ export class SalusPlatformAccessory {
       return;
     }
 
-    await this.platform.writeDeviceProperty(this.device, property, on ? 1 : 0);
+    const sample = this.getPropertyValue(property);
+    const outgoingValue = encodeBooleanLike(sample, on);
+    await this.platform.writeDeviceProperty(this.device, property, outgoingValue);
     this.platform.log.info(`Set On/Off for ${this.device.name} to ${on}`);
   }
 
   private async setBrightness(value: CharacteristicValue): Promise<void> {
-    const target = clamp(Number(value), 0, 100);
+    const numericValue = parseCharacteristicNumber(value);
+    if (numericValue === undefined) {
+      throw this.communicationFailure('Received invalid brightness value from HomeKit');
+    }
+    const target = clamp(numericValue, 0, 100);
     const property = this.writeTargets.brightness;
     if (!property) {
       throw this.communicationFailure('No writable brightness property was discovered');
@@ -666,7 +719,11 @@ export class SalusPlatformAccessory {
   }
 
   private async setTargetPosition(value: CharacteristicValue): Promise<void> {
-    const target = clamp(Number(value), 0, 100);
+    const numericValue = parseCharacteristicNumber(value);
+    if (numericValue === undefined) {
+      throw this.communicationFailure('Received invalid target position value from HomeKit');
+    }
+    const target = clamp(numericValue, 0, 100);
     const property = this.writeTargets.position;
     if (!property) {
       throw this.communicationFailure('No writable position property was discovered');
@@ -679,22 +736,34 @@ export class SalusPlatformAccessory {
   }
 
   private async setValveActive(value: CharacteristicValue): Promise<void> {
-    const active = Number(value) === this.platform.Characteristic.Active.ACTIVE;
+    const numericValue = parseCharacteristicNumber(value);
+    if (numericValue === undefined) {
+      throw this.communicationFailure('Received invalid valve active value from HomeKit');
+    }
+    const active = Math.round(numericValue) === this.platform.Characteristic.Active.ACTIVE;
     const property = this.writeTargets.onOff;
     if (!property) {
       throw this.communicationFailure('No writable valve property was discovered');
     }
-    await this.platform.writeDeviceProperty(this.device, property, active ? 1 : 0);
+    const sample = this.getPropertyValue(property);
+    const outgoingValue = encodeBooleanLike(sample, active);
+    await this.platform.writeDeviceProperty(this.device, property, outgoingValue);
     this.platform.log.info(`Set valve for ${this.device.name} to ${active ? 'active' : 'inactive'}`);
   }
 
   private async setLockTargetState(value: CharacteristicValue): Promise<void> {
-    const shouldLock = Number(value) === this.platform.Characteristic.LockTargetState.SECURED;
+    const numericValue = parseCharacteristicNumber(value);
+    if (numericValue === undefined) {
+      throw this.communicationFailure('Received invalid lock target value from HomeKit');
+    }
+    const shouldLock = Math.round(numericValue) === this.platform.Characteristic.LockTargetState.SECURED;
     const property = this.writeTargets.lock;
     if (!property) {
       throw this.communicationFailure('No writable lock property was discovered');
     }
-    await this.platform.writeDeviceProperty(this.device, property, shouldLock ? 1 : 0);
+    const sample = this.getPropertyValue(property);
+    const outgoingValue = encodeBooleanLike(sample, shouldLock);
+    await this.platform.writeDeviceProperty(this.device, property, outgoingValue);
     this.platform.log.info(`Set lock for ${this.device.name} to ${shouldLock ? 'secured' : 'unsecured'}`);
   }
 
@@ -854,4 +923,37 @@ function mapRunningStateToCurrentState(
     return characteristic.COOL;
   }
   return characteristic.OFF;
+}
+
+function parseCharacteristicNumber(value: CharacteristicValue): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return undefined;
+}
+
+function parseCharacteristicBoolean(value: CharacteristicValue): boolean | undefined {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  const numeric = parseCharacteristicNumber(value);
+  if (numeric !== undefined) {
+    return numeric !== 0;
+  }
+
+  return undefined;
+}
+
+function asErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
 }

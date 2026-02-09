@@ -91,6 +91,13 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
       this.log.info('Homebridge launch completed. Starting Salus device discovery.');
       this.schedulePoll(0);
     });
+
+    this.api.on('shutdown', () => {
+      if (this.pollTimer) {
+        clearTimeout(this.pollTimer);
+        this.pollTimer = null;
+      }
+    });
   }
 
   configureAccessory(accessory: PlatformAccessory): void {
@@ -150,6 +157,10 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
       const uniqueDevices = dedupeDevicesByDsn(devices)
         .filter((device) => !shouldIgnoreInfrastructureDevice(device));
 
+      for (const device of uniqueDevices) {
+        discoveredUuids.add(this.api.hap.uuid.generate(`salus:${device.dsn}`));
+      }
+
       const deviceSnapshots = await mapWithConcurrency(
         uniqueDevices,
         this.maxParallelPropertyRequests,
@@ -165,12 +176,13 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
         },
       );
 
+      let updatedDeviceCount = 0;
       for (const snapshot of deviceSnapshots) {
         if (!snapshot) {
           continue;
         }
+        updatedDeviceCount++;
         const uuid = this.api.hap.uuid.generate(`salus:${snapshot.device.dsn}`);
-        discoveredUuids.add(uuid);
         const existingAccessory = this.accessories.get(uuid);
         if (existingAccessory) {
           this.restoreOrUpdateAccessory(existingAccessory, snapshot.device, snapshot.profile, snapshot.properties);
@@ -180,7 +192,7 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
       }
 
       this.removeStaleAccessories(discoveredUuids);
-      this.log.info(`Salus sync completed: ${deviceSnapshots.length} device(s) discovered.`);
+      this.log.info(`Salus sync completed: ${uniqueDevices.length} device(s) discovered, ${updatedDeviceCount} device(s) refreshed.`);
     } catch (error) {
       this.log.error(`Salus sync failed: ${asErrorMessage(error)}`);
     } finally {
@@ -338,18 +350,23 @@ async function mapWithConcurrency<T, R>(
   concurrency: number,
   mapper: (item: T) => Promise<R>,
 ): Promise<R[]> {
+  if (items.length === 0) {
+    return [];
+  }
+
   const workers = Math.max(1, Math.min(concurrency, items.length));
-  const queue = [...items];
-  const results: R[] = [];
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
 
   const runner = async () => {
     for (;;) {
-      const item = queue.shift();
-      if (!item) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) {
         return;
       }
-      const mapped = await mapper(item);
-      results.push(mapped);
+      const mapped = await mapper(items[index]!);
+      results[index] = mapped;
     }
   };
 

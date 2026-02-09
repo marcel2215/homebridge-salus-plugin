@@ -8,7 +8,7 @@ export function baseNameForProperty(name: string): string {
 }
 
 export function normalizeModelName(model: string): string {
-  return model.replaceAll(/[^A-Za-z0-9]/g, '_').replaceAll('__', '_');
+  return model.replaceAll(/[^A-Za-z0-9]/g, '_').replaceAll(/_+/g, '_');
 }
 
 export function parseBooleanLike(value: unknown): boolean | undefined {
@@ -22,6 +22,9 @@ export function parseBooleanLike(value: unknown): boolean | undefined {
 
   if (typeof value === 'string') {
     const normalized = value.trim().toLowerCase();
+    if (normalized === '') {
+      return undefined;
+    }
     if (normalized === 'true' || normalized === 'on' || normalized === 'open' || normalized === 'locked') {
       return true;
     }
@@ -42,7 +45,11 @@ export function parseNumberLike(value: unknown): number | undefined {
     return value;
   }
   if (typeof value === 'string') {
-    const parsed = Number(value.trim());
+    const trimmed = value.trim();
+    if (trimmed.length === 0) {
+      return undefined;
+    }
+    const parsed = Number(trimmed);
     if (Number.isFinite(parsed)) {
       return parsed;
     }
@@ -152,6 +159,52 @@ export function encodePercentageLike(sample: unknown, percentage: number): numbe
   return bounded;
 }
 
+export function encodeBooleanLike(sample: unknown, enabled: boolean): number | string | boolean {
+  if (typeof sample === 'boolean') {
+    return enabled;
+  }
+
+  if (typeof sample === 'number') {
+    return enabled ? 1 : 0;
+  }
+
+  if (typeof sample === 'string') {
+    const trimmed = sample.trim();
+    const normalized = trimmed.toLowerCase();
+
+    if (normalized === 'true' || normalized === 'false') {
+      return preserveStringCase(trimmed, enabled ? 'true' : 'false');
+    }
+    if (normalized === 'on' || normalized === 'off') {
+      return preserveStringCase(trimmed, enabled ? 'on' : 'off');
+    }
+    if (normalized === 'open' || normalized === 'closed') {
+      return preserveStringCase(trimmed, enabled ? 'open' : 'closed');
+    }
+    if (normalized === 'locked' || normalized === 'unlocked') {
+      return preserveStringCase(trimmed, enabled ? 'locked' : 'unlocked');
+    }
+    if (normalized === '1' || normalized === '0') {
+      return enabled ? '1' : '0';
+    }
+  }
+
+  return enabled ? 1 : 0;
+}
+
 export function clamp(value: number, minValue: number, maxValue: number): number {
   return Math.max(minValue, Math.min(maxValue, value));
+}
+
+function preserveStringCase(sample: string, nextValue: string): string {
+  if (sample === sample.toUpperCase()) {
+    return nextValue.toUpperCase();
+  }
+  if (sample === sample.toLowerCase()) {
+    return nextValue;
+  }
+  if (sample[0] === sample[0]?.toUpperCase() && sample.slice(1) === sample.slice(1).toLowerCase()) {
+    return `${nextValue[0]?.toUpperCase() ?? ''}${nextValue.slice(1)}`;
+  }
+  return nextValue;
 }

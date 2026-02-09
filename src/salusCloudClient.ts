@@ -57,6 +57,8 @@ class HttpStatusError extends Error {
 
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_BASE_DELAY_MS = 750;
+const MAX_RETRY_DELAY_MS = 60_000;
+const MAX_PREFERRED_WRITE_CACHE_SIZE = 2_000;
 const DEFAULT_COGNITO_REGION = 'eu-central-1';
 const DEFAULT_COGNITO_CLIENT_ID = '4pk5efh3v84g5dav43imsv4fbj';
 const DEFAULT_EU_SERVICE_API_HOST = 'https://service-api.eu.premium.salusconnect.io';
@@ -71,6 +73,17 @@ const SESSION_REFRESH_SAFETY_MS = 60_000;
 const STATUS_ALLOW_PATH_FALLBACK = new Set([404, 405, 426]);
 const STATUS_ALLOW_WRITE_SHAPE_FALLBACK = new Set([400, 404, 405, 409, 415, 422]);
 const DEFAULT_EXPECTED_STATUSES = [200, 201, 202, 204];
+const RETRIABLE_ERROR_CODES = new Set([
+  'ABORT_ERR',
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'EAI_AGAIN',
+  'ENOTFOUND',
+  'ETIMEDOUT',
+  'EHOSTUNREACH',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_SOCKET',
+]);
 
 const METADATA_FIELD_NAMES = new Set([
   'id',
@@ -117,6 +130,11 @@ export class SalusCloudClient {
   private readonly propertyCacheByDsn: Map<string, SalusPropertyMap> = new Map();
   private readonly deviceIdToDsn: Map<string, string> = new Map();
   private readonly deviceKeyToDsn: Map<string, string> = new Map();
+  private preferredShadowVariantDescription: string | null = null;
+  private readonly preferredWriteAttemptByKey: Map<string, string> = new Map();
+  private insecureTlsInFlight = 0;
+  private insecureTlsPreviousValue: string | undefined;
+  private insecureTlsHadPreviousValue = false;
 
   constructor(
     private readonly log: Logging,
@@ -210,8 +228,11 @@ export class SalusCloudClient {
   }
 
   public async setDatapoint(dsn: string, propertyName: string, value: unknown): Promise<void> {
-    const attempts = this.buildWriteAttempts(dsn, propertyName, value);
+    const writeCacheKey = `${dsn}:${propertyName}`;
+    const preferredAttempt = this.preferredWriteAttemptByKey.get(writeCacheKey) ?? null;
+    const attempts = prioritizeByDescription(this.buildWriteAttempts(dsn, propertyName, value), preferredAttempt);
     const failures: string[] = [];
+    let fatalError: unknown;
 
     for (const attempt of attempts) {
       try {
@@ -223,20 +244,51 @@ export class SalusCloudClient {
         });
 
         this.updateCachedProperty(dsn, propertyName, value);
+        this.rememberPreferredWriteAttempt(writeCacheKey, attempt.description);
         if (this.verboseLogging) {
           this.log.debug(`Write succeeded via ${attempt.description}`);
         }
         return;
       } catch (error) {
+        const failureMessage = error instanceof HttpStatusError
+          ? `${attempt.description} -> HTTP ${error.status}`
+          : `${attempt.description} -> ${asErrorMessage(error)}`;
+        failures.push(failureMessage);
+
         if (error instanceof HttpStatusError && STATUS_ALLOW_WRITE_SHAPE_FALLBACK.has(error.status)) {
-          failures.push(`${attempt.description} -> HTTP ${error.status}`);
           continue;
         }
-        failures.push(`${attempt.description} -> ${asErrorMessage(error)}`);
+        if (error instanceof HttpStatusError && STATUS_ALLOW_PATH_FALLBACK.has(error.status)) {
+          continue;
+        }
+        if (isRetriableFailure(error)) {
+          fatalError = error;
+          break;
+        }
+        fatalError = error;
+        break;
       }
     }
 
+    if (fatalError) {
+      throw new Error(
+        `Failed to write property ${propertyName} on ${dsn}. Fatal error: ${asErrorMessage(fatalError)}. Attempts: ${failures.join(' | ')}`,
+      );
+    }
     throw new Error(`Failed to write property ${propertyName} on ${dsn}. Attempts: ${failures.join(' | ')}`);
+  }
+
+  private rememberPreferredWriteAttempt(cacheKey: string, description: string): void {
+    this.preferredWriteAttemptByKey.delete(cacheKey);
+    this.preferredWriteAttemptByKey.set(cacheKey, description);
+
+    while (this.preferredWriteAttemptByKey.size > MAX_PREFERRED_WRITE_CACHE_SIZE) {
+      const oldestKey = this.preferredWriteAttemptByKey.keys().next().value;
+      if (!oldestKey) {
+        return;
+      }
+      this.preferredWriteAttemptByKey.delete(oldestKey);
+    }
   }
 
   private rebuildDeviceIndex(devices: SalusDevice[]): void {
@@ -272,7 +324,7 @@ export class SalusCloudClient {
   private async fetchDeviceShadows(devices: SalusDevice[], preferredDsns?: string[]): Promise<Map<string, SalusPropertyMap>> {
     const dsns = [...new Set((preferredDsns ?? devices.map((device) => device.dsn)).filter((value) => value.trim() !== ''))];
     const ids = [...new Set(devices.map((device) => device.id).filter((value) => value.trim() !== ''))];
-    const keys = [...new Set(devices.map((device) => device.key).filter((value): value is string => Boolean(value && value.trim() !== '')))] ;
+    const keys = [...new Set(devices.map((device) => device.key).filter((value): value is string => Boolean(value && value.trim() !== '')))];
 
     const variants: ShadowRequestVariant[] = [
       {
@@ -326,7 +378,10 @@ export class SalusCloudClient {
       });
     }
 
-    for (const variant of variants) {
+    const orderedVariants = prioritizeByDescription(variants, this.preferredShadowVariantDescription);
+    let lastRecoverableError: unknown;
+
+    for (const variant of orderedVariants) {
       try {
         const payload = await this.requestServiceJsonWithPathFallback<unknown>(
           [variant.path],
@@ -339,7 +394,12 @@ export class SalusCloudClient {
 
         const map = parseDeviceShadows(payload, this.deviceIdToDsn, this.deviceKeyToDsn);
         if (map.size > 0) {
+          this.preferredShadowVariantDescription = variant.description;
           return map;
+        }
+
+        if (this.verboseLogging) {
+          this.log.debug(`Shadow variant ${variant.description} returned no device properties.`);
         }
       } catch (error) {
         if (error instanceof HttpStatusError && STATUS_ALLOW_PATH_FALLBACK.has(error.status)) {
@@ -354,10 +414,22 @@ export class SalusCloudClient {
           }
           continue;
         }
-        if (this.verboseLogging) {
-          this.log.debug(`Shadow request failed for ${variant.description}: ${asErrorMessage(error)}`);
+        if (isRetriableFailure(error)) {
+          lastRecoverableError = error;
+          if (this.verboseLogging) {
+            this.log.debug(`Retryable shadow request failure for ${variant.description}: ${asErrorMessage(error)}`);
+          }
+          continue;
         }
+        if (this.verboseLogging) {
+          this.log.debug(`Fatal shadow request failure for ${variant.description}: ${asErrorMessage(error)}`);
+        }
+        throw error;
       }
+    }
+
+    if (lastRecoverableError) {
+      throw new Error(`Unable to fetch Salus device shadows: ${asErrorMessage(lastRecoverableError)}`);
     }
 
     return new Map();
@@ -554,27 +626,8 @@ export class SalusCloudClient {
     }
 
     this.authRequestInFlight = (async () => {
-      const email = this.config.email?.trim();
-      const password = this.config.password;
-      if (!email || !password) {
-        throw new Error('Salus credentials are missing. Set email and password in plugin config.');
-      }
-
-      const payload = await this.cognitoInitiateAuth({
-        AuthFlow: 'USER_PASSWORD_AUTH',
-        ClientId: this.cognitoClientId,
-        AuthParameters: {
-          USERNAME: email,
-          PASSWORD: password,
-        },
-      });
-
-      const tokens = parseCognitoTokens(payload);
-      if (!tokens) {
-        throw new Error('Cognito login succeeded but token payload was missing AccessToken/RefreshToken.');
-      }
-
-      this.session = tokens;
+      this.session = null;
+      this.session = await this.authenticateWithPassword();
       this.log.info('Authenticated with Salus cloud');
     })();
 
@@ -594,25 +647,17 @@ export class SalusCloudClient {
       const refreshToken = this.session?.refreshToken;
       if (!refreshToken) {
         this.session = null;
-        await this.login();
+        this.session = await this.authenticateWithPassword();
+        this.log.info('Authenticated with Salus cloud');
         return;
       }
 
-      const payload = await this.cognitoInitiateAuth({
-        AuthFlow: 'REFRESH_TOKEN_AUTH',
-        ClientId: this.cognitoClientId,
-        AuthParameters: {
-          REFRESH_TOKEN: refreshToken,
-        },
-      });
-
-      const refreshed = parseCognitoTokens(payload, refreshToken);
-      if (!refreshed) {
+      try {
+        this.session = await this.authenticateWithRefreshToken(refreshToken);
+      } catch (error) {
         this.session = null;
-        throw new Error('Cognito refresh response did not include AccessToken.');
+        throw error;
       }
-
-      this.session = refreshed;
       if (this.verboseLogging) {
         this.log.debug('Refreshed Salus cloud session token');
       }
@@ -625,24 +670,99 @@ export class SalusCloudClient {
     }
   }
 
-  private async cognitoInitiateAuth(body: Record<string, unknown>): Promise<unknown> {
-    const response = await this.fetchWithTimeout(this.cognitoEndpoint, {
-      method: 'POST',
-      headers: {
-        Accept: 'application/x-amz-json-1.1',
-        'Content-Type': 'application/x-amz-json-1.1',
-        'X-Amz-Target': COGNITO_INITIATE_AUTH_TARGET,
-      },
-      body: JSON.stringify(body),
-    });
-
-    if (!response.ok) {
-      const responseBody = await safeReadText(response);
-      const cognitoMessage = parseCognitoErrorMessage(responseBody);
-      throw new Error(`Cognito auth failed (HTTP ${response.status}): ${cognitoMessage}`);
+  private async authenticateWithPassword(): Promise<CognitoSession> {
+    const email = this.config.email?.trim();
+    const password = this.config.password;
+    if (!email || !password) {
+      throw new Error('Salus credentials are missing. Set email and password in plugin config.');
     }
 
-    return await response.json() as unknown;
+    const payload = await this.cognitoInitiateAuth({
+      AuthFlow: 'USER_PASSWORD_AUTH',
+      ClientId: this.cognitoClientId,
+      AuthParameters: {
+        USERNAME: email,
+        PASSWORD: password,
+      },
+    });
+
+    const tokens = parseCognitoTokens(payload);
+    if (!tokens) {
+      throw new Error('Cognito login succeeded but token payload was missing AccessToken/RefreshToken.');
+    }
+
+    return tokens;
+  }
+
+  private async authenticateWithRefreshToken(refreshToken: string): Promise<CognitoSession> {
+    const payload = await this.cognitoInitiateAuth({
+      AuthFlow: 'REFRESH_TOKEN_AUTH',
+      ClientId: this.cognitoClientId,
+      AuthParameters: {
+        REFRESH_TOKEN: refreshToken,
+      },
+    });
+
+    const refreshed = parseCognitoTokens(payload, refreshToken);
+    if (!refreshed) {
+      throw new Error('Cognito refresh response did not include AccessToken.');
+    }
+
+    return refreshed;
+  }
+
+  private async cognitoInitiateAuth(body: Record<string, unknown>): Promise<unknown> {
+    const totalAttempts = this.maxRetries + 1;
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+      try {
+        const response = await this.fetchWithTimeout(this.cognitoEndpoint, {
+          method: 'POST',
+          headers: {
+            Accept: 'application/x-amz-json-1.1',
+            'Content-Type': 'application/x-amz-json-1.1',
+            'X-Amz-Target': COGNITO_INITIATE_AUTH_TARGET,
+          },
+          body: JSON.stringify(body),
+        });
+
+        if (!response.ok) {
+          const responseBody = await safeReadText(response);
+          const cognitoMessage = parseCognitoErrorMessage(responseBody);
+          const cognitoError = new HttpStatusError(
+            `Cognito auth failed (HTTP ${response.status}): ${cognitoMessage}`,
+            response.status,
+            responseBody,
+          );
+
+          if (isRetriableStatus(response.status) && attempt < totalAttempts) {
+            lastError = cognitoError;
+            await this.retryDelay(attempt, cognitoError.message);
+            continue;
+          }
+
+          throw cognitoError;
+        }
+
+        return await response.json() as unknown;
+      } catch (error) {
+        if (!this.allowInsecureTls && isTlsCertificateError(error)) {
+          const message = `${asErrorMessage(error)}. If Salus cloud certificate is invalid, set "allowInsecureTls": true in plugin config.`;
+          throw new Error(message);
+        }
+
+        if (isRetriableFailure(error) && attempt < totalAttempts) {
+          lastError = error;
+          await this.retryDelay(attempt, asErrorMessage(error));
+          continue;
+        }
+
+        throw error;
+      }
+    }
+
+    throw new Error(`Cognito auth failed after retries: ${asErrorMessage(lastError)}`);
   }
 
   private async requestServiceJsonWithPathFallback<T>(paths: string[], options: RequestOptions): Promise<T> {
@@ -677,10 +797,14 @@ export class SalusCloudClient {
     const totalAttempts = this.maxRetries + 1;
 
     let hasRefreshedSessionAfter401 = false;
-    let lastError: unknown;
+    let lastError: unknown = new Error(`No Salus cloud response received for ${options.method} ${path}`);
 
     for (let attempt = 1; attempt <= totalAttempts; attempt++) {
       const orderedBaseUrls = this.getOrderedServiceApiBaseUrls();
+      let sawRetriableFailure = false;
+      let sawDefinitiveFailure = false;
+      let definitiveError: unknown;
+      let lastRetriableError: unknown;
 
       for (const baseUrl of orderedBaseUrls) {
         try {
@@ -702,6 +826,8 @@ export class SalusCloudClient {
             this.log.warn(`Salus cloud returned 401 for ${options.method} ${path}. Refreshing session token and retrying.`);
             await this.refreshSession();
             lastError = new HttpStatusError('Unauthorized', 401, '');
+            sawRetriableFailure = true;
+            lastRetriableError = lastError;
             continue;
           }
 
@@ -719,12 +845,19 @@ export class SalusCloudClient {
               continue;
             }
 
-            if (isRetriableStatus(response.status) && attempt < totalAttempts) {
+            if (isRetriableStatus(response.status)) {
               lastError = statusError;
-              break;
+              sawRetriableFailure = true;
+              lastRetriableError = statusError;
+              continue;
             }
 
-            throw statusError;
+            lastError = statusError;
+            sawDefinitiveFailure = true;
+            if (!definitiveError) {
+              definitiveError = statusError;
+            }
+            continue;
           }
 
           this.activeServiceApiBaseUrl = baseUrl;
@@ -742,20 +875,35 @@ export class SalusCloudClient {
 
           if (error instanceof HttpStatusError) {
             lastError = error;
+            if (isRetriableStatus(error.status)) {
+              sawRetriableFailure = true;
+              lastRetriableError = error;
+            } else if (!STATUS_ALLOW_PATH_FALLBACK.has(error.status)) {
+              sawDefinitiveFailure = true;
+              if (!definitiveError) {
+                definitiveError = error;
+              }
+            }
             continue;
           }
 
-          if (isRetriableError(error) && attempt < totalAttempts) {
+          if (isRetriableError(error)) {
             lastError = error;
-            break;
+            sawRetriableFailure = true;
+            lastRetriableError = error;
+            continue;
           }
 
           throw error;
         }
       }
 
-      if (attempt < totalAttempts && isRetriableFailure(lastError)) {
-        await this.retryDelay(attempt, asErrorMessage(lastError));
+      if (sawDefinitiveFailure) {
+        throw definitiveError ?? lastError;
+      }
+
+      if (attempt < totalAttempts && sawRetriableFailure) {
+        await this.retryDelay(attempt, asErrorMessage(lastRetriableError ?? lastError));
         continue;
       }
 
@@ -813,7 +961,9 @@ export class SalusCloudClient {
   }
 
   private async retryDelay(attempt: number, reason: string): Promise<void> {
-    const delayMs = this.retryBaseDelayMs * (2 ** (attempt - 1));
+    const baseDelay = Math.min(MAX_RETRY_DELAY_MS, this.retryBaseDelayMs * (2 ** (attempt - 1)));
+    const jitter = 0.85 + (Math.random() * 0.3);
+    const delayMs = Math.max(250, Math.round(baseDelay * jitter));
     this.log.warn(`Retrying Salus cloud request in ${delayMs}ms (attempt ${attempt + 1}/${this.maxRetries + 1}): ${reason}`);
     await sleep(delayMs);
   }
@@ -823,10 +973,14 @@ export class SalusCloudClient {
     const timer = setTimeout(() => {
       controller.abort();
     }, this.requestTimeoutMs);
-    const previousTlsSetting = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
 
-    if (this.allowInsecureTls) {
+    if (this.allowInsecureTls && this.insecureTlsInFlight === 0) {
+      this.insecureTlsHadPreviousValue = Object.prototype.hasOwnProperty.call(process.env, 'NODE_TLS_REJECT_UNAUTHORIZED');
+      this.insecureTlsPreviousValue = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
       process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+    }
+    if (this.allowInsecureTls) {
+      this.insecureTlsInFlight += 1;
     }
 
     try {
@@ -837,10 +991,17 @@ export class SalusCloudClient {
     } finally {
       clearTimeout(timer);
       if (this.allowInsecureTls) {
-        if (previousTlsSetting === undefined) {
-          delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-        } else {
-          process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTlsSetting;
+        this.insecureTlsInFlight = Math.max(0, this.insecureTlsInFlight - 1);
+        if (this.insecureTlsInFlight === 0) {
+          if (this.insecureTlsHadPreviousValue) {
+            if (this.insecureTlsPreviousValue === undefined) {
+              delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+            } else {
+              process.env.NODE_TLS_REJECT_UNAUTHORIZED = this.insecureTlsPreviousValue;
+            }
+          } else {
+            delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+          }
         }
       }
     }
@@ -998,50 +1159,57 @@ function parseDevices(payload: unknown): SalusDevice[] {
     }
   }
 
-  const selected = candidates.find((candidate) => candidate.length > 0) ?? [];
   const result: SalusDevice[] = [];
+  const visitedEntries = new Set<unknown>();
 
-  for (const item of selected) {
-    const rawItem = asRecord(item);
-    const deviceWrapper = rawItem?.device;
-    const normalized = asRecord(deviceWrapper) ?? rawItem;
-    if (!normalized) {
-      continue;
+  for (const candidate of candidates) {
+    for (const item of candidate) {
+      if (visitedEntries.has(item)) {
+        continue;
+      }
+      visitedEntries.add(item);
+
+      const rawItem = asRecord(item);
+      const deviceWrapper = rawItem?.device;
+      const normalized = asRecord(deviceWrapper) ?? rawItem;
+      if (!normalized) {
+        continue;
+      }
+
+      const dsn = asString(normalized.dsn)
+        ?? asString(normalized.device_dsn)
+        ?? asString(normalized.DSN);
+      if (!dsn) {
+        continue;
+      }
+
+      const key = asString(normalized.key) ?? asString(normalized.device_key);
+      const id = asString(normalized.id)
+        ?? asString(normalized.device_id)
+        ?? key
+        ?? dsn;
+
+      const modelRaw = asString(normalized.oem_model)
+        ?? asString(normalized.model)
+        ?? asString(normalized.product_class)
+        ?? asString(normalized.device_model)
+        ?? '';
+
+      const model = normalizeModelName(modelRaw);
+      const displayName = deriveDeviceDisplayName(normalized, dsn, model);
+      const online = deriveOnlineState(normalized);
+
+      result.push({
+        id,
+        dsn,
+        key,
+        model,
+        name: displayName,
+        productName: asString(normalized.product_name),
+        online,
+        raw: normalized,
+      });
     }
-
-    const dsn = asString(normalized.dsn)
-      ?? asString(normalized.device_dsn)
-      ?? asString(normalized.DSN);
-    if (!dsn) {
-      continue;
-    }
-
-    const key = asString(normalized.key) ?? asString(normalized.device_key);
-    const id = asString(normalized.id)
-      ?? asString(normalized.device_id)
-      ?? key
-      ?? dsn;
-
-    const modelRaw = asString(normalized.oem_model)
-      ?? asString(normalized.model)
-      ?? asString(normalized.product_class)
-      ?? asString(normalized.device_model)
-      ?? '';
-
-    const model = normalizeModelName(modelRaw);
-    const displayName = deriveDeviceDisplayName(normalized, dsn, model);
-    const online = deriveOnlineState(normalized);
-
-    result.push({
-      id,
-      dsn,
-      key,
-      model,
-      name: displayName,
-      productName: asString(normalized.product_name),
-      online,
-      raw: normalized,
-    });
   }
 
   return dedupeDevicesByDsn(result);
@@ -1334,6 +1502,10 @@ function extractPropertyTimestamp(rawValue: unknown): string | undefined {
 }
 
 function looksLikePropertyName(name: string, rawValue: unknown): boolean {
+  if (/^\d+$/.test(name)) {
+    return false;
+  }
+
   if (name.includes(':')) {
     return true;
   }
@@ -1431,6 +1603,19 @@ function mergePropertyMaps(target: SalusPropertyMap, source: SalusPropertyMap): 
   }
 }
 
+function prioritizeByDescription<T extends { description: string }>(items: T[], preferredDescription: string | null): T[] {
+  if (!preferredDescription) {
+    return items;
+  }
+
+  const preferred = items.find((item) => item.description === preferredDescription);
+  if (!preferred) {
+    return items;
+  }
+
+  return [preferred, ...items.filter((item) => item !== preferred)];
+}
+
 function isRetriableFailure(error: unknown): boolean {
   if (error instanceof HttpStatusError) {
     return isRetriableStatus(error.status);
@@ -1447,11 +1632,17 @@ function isRetriableError(error: unknown): boolean {
     return false;
   }
 
+  const code = getErrorCauseCode(error)?.toUpperCase();
+  if (code && RETRIABLE_ERROR_CODES.has(code)) {
+    return true;
+  }
+
   const message = error.message.toLowerCase();
   return message.includes('timed out')
     || message.includes('network')
     || message.includes('fetch failed')
     || message.includes('aborted')
+    || message.includes('econnreset')
     || message.includes('ecconnreset')
     || message.includes('eai_again')
     || message.includes('enotfound')
@@ -1478,6 +1669,18 @@ function asErrorMessage(error: unknown): string {
 }
 
 function getErrorCauseCode(error: Error): string | undefined {
+  const directCode = (error as Error & { code?: unknown }).code;
+  if (typeof directCode === 'string') {
+    return directCode;
+  }
+
+  if (error.cause instanceof Error) {
+    const nestedCode = (error.cause as Error & { code?: unknown }).code;
+    if (typeof nestedCode === 'string') {
+      return nestedCode;
+    }
+  }
+
   const cause = error.cause as Record<string, unknown> | undefined;
   const code = cause?.code;
   if (typeof code === 'string') {
