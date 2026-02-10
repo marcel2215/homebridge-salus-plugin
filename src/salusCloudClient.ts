@@ -92,6 +92,7 @@ const ACCEPT_LANGUAGE = 'en-US,en;q=0.9,en;q=0.8';
 const SESSION_REFRESH_SAFETY_MS = 60_000;
 const LEGACY_SESSION_REFRESH_SAFETY_MS = 60_000;
 const LEGACY_DEFAULT_SESSION_TTL_MS = 45 * 60_000;
+const MAX_UNAUTHORIZED_RECOVERY_STEPS = 120;
 
 const STATUS_ALLOW_PATH_FALLBACK = new Set([404, 405, 426]);
 const STATUS_ALLOW_WRITE_SHAPE_FALLBACK = new Set([400, 404, 405, 409, 415, 422]);
@@ -108,8 +109,21 @@ const RETRIABLE_ERROR_CODES = new Set([
   'UND_ERR_SOCKET',
 ]);
 const DEFAULT_COMPANY_CODE_FALLBACKS = [
-  'SALUS',
+  'salus-eu',
+  'salus-us',
+  'salus',
+  'salus_eu',
+  'salus_us',
+  'heatlink_us',
+  'mrpex_us',
+  'neotherm_eu',
+  'omnie_eu',
+  'purmo',
+  'clp_sg',
+  'clp',
+  'SALUS_EU',
   'SALUS_US',
+  'SALUS',
   'HEATLINK_US',
   'MRPEX_US',
   'NEOTHERM_EU',
@@ -121,6 +135,14 @@ const DEFAULT_COMPANY_CODE_FALLBACKS = [
   'MRPEX',
   'NEOTHERM',
   'OMNIE',
+];
+const LEGACY_LOGIN_PATH_CANDIDATES = [
+  '/users/sign_in.json',
+  '/users/sign_in',
+  '/api/v1/users/sign_in.json',
+  '/api/v1/users/sign_in',
+  '/apiv1/users/sign_in.json',
+  '/apiv1/users/sign_in',
 ];
 const NO_COMPANY_CODE_SENTINEL = '__none__';
 
@@ -547,7 +569,7 @@ export class SalusCloudClient {
     if (!this.hasWarnedAboutLegacyFallback) {
       this.hasWarnedAboutLegacyFallback = true;
       this.log.warn(`Switching to legacy Salus cloud compatibility mode (${reason})`);
-      this.log.warn('Legacy mode uses /users/sign_in.json and /apiv1 endpoints for tenant compatibility.');
+      this.log.warn('Legacy mode probes multiple legacy sign-in paths and /apiv1 endpoints for tenant compatibility.');
     }
   }
 
@@ -877,7 +899,11 @@ export class SalusCloudClient {
   }
 
   private refreshCompanyCodeCandidates(): void {
-    const candidates = buildCompanyCodeCandidates(this.configuredCompanyCode, this.session?.companyCode);
+    const candidates = buildCompanyCodeCandidates(
+      this.configuredCompanyCode,
+      this.session?.companyCode,
+      this.config.region,
+    );
     this.companyCodeCandidates = candidates;
 
     if (this.activeCompanyCode && candidates.includes(this.activeCompanyCode)) {
@@ -1019,6 +1045,54 @@ export class SalusCloudClient {
       throw new Error('Salus credentials are missing. Set email and password in plugin config.');
     }
 
+    const loginVariants: Array<{
+      description: string;
+      headers: Record<string, string>;
+      body: string;
+    }> = [
+      {
+        description: 'JSON payload with nested user object',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          'Accept-Language': ACCEPT_LANGUAGE,
+          'User-Agent': 'homebridge-salus-cloud/2026',
+        },
+        body: JSON.stringify({
+          user: {
+            email,
+            password,
+          },
+        }),
+      },
+      {
+        description: 'JSON payload with flat credentials',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          'Accept-Language': ACCEPT_LANGUAGE,
+          'User-Agent': 'homebridge-salus-cloud/2026',
+        },
+        body: JSON.stringify({
+          email,
+          password,
+        }),
+      },
+      {
+        description: 'Form-encoded payload with nested user fields',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Accept-Language': ACCEPT_LANGUAGE,
+          'User-Agent': 'homebridge-salus-cloud/2026',
+        },
+        body: new URLSearchParams({
+          'user[email]': email,
+          'user[password]': password,
+        }).toString(),
+      },
+    ];
+
     const totalAttempts = this.maxRetries + 1;
     let lastError: unknown = new Error('Legacy Salus login did not return a session');
 
@@ -1029,81 +1103,79 @@ export class SalusCloudClient {
       let definitiveError: unknown;
 
       for (const baseUrl of orderedBaseUrls) {
-        try {
-          const response = await this.fetchWithTimeout(
-            buildLegacyUrl(baseUrl, '/users/sign_in.json', true),
-            {
-              method: 'POST',
-              headers: {
-                Accept: 'application/json',
-                'Content-Type': 'application/json',
-                'Accept-Language': ACCEPT_LANGUAGE,
-                'User-Agent': 'homebridge-salus-cloud/2026',
-              },
-              body: JSON.stringify({
-                user: {
-                  email,
-                  password,
+        for (const path of LEGACY_LOGIN_PATH_CANDIDATES) {
+          for (const variant of loginVariants) {
+            try {
+              const response = await this.fetchWithTimeout(
+                buildLegacyUrl(baseUrl, path, true),
+                {
+                  method: 'POST',
+                  headers: variant.headers,
+                  body: variant.body,
                 },
-              }),
-            },
-          );
+              );
 
-          if (!response.ok) {
-            const responseText = await safeReadText(response);
-            const statusError = new HttpStatusError(
-              responseText
-                ? `Legacy Salus login failed at ${baseUrl} (HTTP ${response.status}) :: ${responseText}`
-                : `Legacy Salus login failed at ${baseUrl} (HTTP ${response.status})`,
-              response.status,
-              responseText,
-            );
+              if (!response.ok) {
+                const responseText = await safeReadText(response);
+                const statusError = new HttpStatusError(
+                  responseText
+                    ? `Legacy Salus login failed at ${baseUrl}${path} via ${variant.description} (HTTP ${response.status}) :: ${responseText}`
+                    : `Legacy Salus login failed at ${baseUrl}${path} via ${variant.description} (HTTP ${response.status})`,
+                  response.status,
+                  responseText,
+                );
 
-            if (isRetriableStatus(response.status)) {
-              lastError = statusError;
-              sawRetriableFailure = true;
-              continue;
+                lastError = statusError;
+
+                if (STATUS_ALLOW_PATH_FALLBACK.has(response.status)) {
+                  continue;
+                }
+                if (response.status === 400 || response.status === 415 || response.status === 422) {
+                  continue;
+                }
+                if (isRetriableStatus(response.status)) {
+                  sawRetriableFailure = true;
+                  continue;
+                }
+
+                sawDefinitiveFailure = true;
+                if (!definitiveError) {
+                  definitiveError = statusError;
+                }
+                continue;
+              }
+
+              const payload = await parseResponseBody<unknown>(response);
+              const session = parseLegacyTokens(payload);
+              if (!session) {
+                const parseError = new Error(
+                  `Legacy Salus login succeeded at ${baseUrl}${path}, but access token was missing in response.`,
+                );
+                lastError = parseError;
+                continue;
+              }
+
+              this.activeLegacyApiBaseUrl = baseUrl;
+              return session;
+            } catch (error) {
+              if (!this.allowInsecureTls && isTlsCertificateError(error)) {
+                const message = `${asErrorMessage(error)}. If Salus cloud certificate is invalid, set "allowInsecureTls": true in plugin config.`;
+                throw new Error(message);
+              }
+
+              if (isRetriableFailure(error)) {
+                sawRetriableFailure = true;
+                lastError = error;
+                continue;
+              }
+
+              sawDefinitiveFailure = true;
+              if (!definitiveError) {
+                definitiveError = error;
+              }
+              lastError = error;
             }
-
-            sawDefinitiveFailure = true;
-            if (!definitiveError) {
-              definitiveError = statusError;
-            }
-            lastError = statusError;
-            continue;
           }
-
-          const payload = await parseResponseBody<unknown>(response);
-          const session = parseLegacyTokens(payload);
-          if (!session) {
-            const parseError = new Error(`Legacy Salus login succeeded at ${baseUrl}, but access token was missing in response.`);
-            sawDefinitiveFailure = true;
-            if (!definitiveError) {
-              definitiveError = parseError;
-            }
-            lastError = parseError;
-            continue;
-          }
-
-          this.activeLegacyApiBaseUrl = baseUrl;
-          return session;
-        } catch (error) {
-          if (!this.allowInsecureTls && isTlsCertificateError(error)) {
-            const message = `${asErrorMessage(error)}. If Salus cloud certificate is invalid, set "allowInsecureTls": true in plugin config.`;
-            throw new Error(message);
-          }
-
-          if (isRetriableFailure(error)) {
-            sawRetriableFailure = true;
-            lastError = error;
-            continue;
-          }
-
-          sawDefinitiveFailure = true;
-          if (!definitiveError) {
-            definitiveError = error;
-          }
-          lastError = error;
         }
       }
 
@@ -1273,6 +1345,7 @@ export class SalusCloudClient {
     let hasRefreshedSessionAfter401 = false;
     let attemptedAuthProfiles = new Set<AuthorizationHeaderProfile>([this.authorizationHeaderProfile]);
     const attemptedCompanyCodes = new Set<string>([companyCodeCandidateKey(this.activeCompanyCode)]);
+    let unauthorizedRecoverySteps = 0;
     let lastError: unknown = new Error(`No Salus cloud response received for ${options.method} ${path}`);
 
     for (let attempt = 1; attempt <= totalAttempts; attempt++) {
@@ -1302,8 +1375,9 @@ export class SalusCloudClient {
             const responseText = await safeReadText(response);
             const responseCode = extractServiceResponseCode(responseText);
             const hintedCompanyCode = extractCompanyCodeFromServiceAuthError(responseText);
+            const isCompanyCodeMismatch = responseCode === '900008';
 
-            if (responseCode === '900008' && !this.hasWarnedAboutAuthCompanyCode) {
+            if (isCompanyCodeMismatch && !this.hasWarnedAboutAuthCompanyCode) {
               this.hasWarnedAboutAuthCompanyCode = true;
               this.log.warn(
                 'Salus cloud returned response_code=900008 (Not authorized). This often indicates tenant/company authorization context mismatch.',
@@ -1311,6 +1385,10 @@ export class SalusCloudClient {
             }
 
             if ((options.allow401Refresh ?? true) && !hasRefreshedSessionAfter401) {
+              unauthorizedRecoverySteps += 1;
+              if (unauthorizedRecoverySteps > MAX_UNAUTHORIZED_RECOVERY_STEPS) {
+                throw new Error(`Exceeded maximum unauthorized recovery steps while requesting ${options.method} ${path}`);
+              }
               hasRefreshedSessionAfter401 = true;
               this.log.warn(`Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}. Refreshing session token and retrying.`);
               await this.refreshSession();
@@ -1321,14 +1399,36 @@ export class SalusCloudClient {
               continue;
             }
 
-            if (responseCode === '900008') {
-              throw new LegacyFallbackRequiredError(
-                `Modern Salus API returned response_code=900008 on ${options.method} ${path} at ${baseUrl}.`,
-              );
+            if (isCompanyCodeMismatch) {
+              const previousCompanyCode = this.activeCompanyCode;
+              const rotatedCompanyCode = this.rotateCompanyCodeCandidate(attemptedCompanyCodes, hintedCompanyCode);
+              if (companyCodeCandidateKey(rotatedCompanyCode) !== companyCodeCandidateKey(previousCompanyCode)) {
+                unauthorizedRecoverySteps += 1;
+                if (unauthorizedRecoverySteps > MAX_UNAUTHORIZED_RECOVERY_STEPS) {
+                  throw new Error(`Exceeded maximum unauthorized recovery steps while requesting ${options.method} ${path}`);
+                }
+                this.authorizationHeaderProfile = 'accessBearer';
+                attemptedAuthProfiles = new Set<AuthorizationHeaderProfile>([this.authorizationHeaderProfile]);
+                this.log.warn(
+                  rotatedCompanyCode
+                    ? `Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}.`
+                      + ` Retrying with alternate company code header: ${rotatedCompanyCode}.`
+                    : `Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}. Retrying without company code header.`,
+                );
+                lastError = new HttpStatusError('Unauthorized', 401, responseText);
+                sawRetriableFailure = true;
+                lastRetriableError = lastError;
+                baseIndex -= 1;
+                continue;
+              }
             }
 
             const rotatedTo = rotateAuthorizationHeaderProfile(this.authorizationHeaderProfile);
             if (rotatedTo !== this.authorizationHeaderProfile && !attemptedAuthProfiles.has(rotatedTo)) {
+              unauthorizedRecoverySteps += 1;
+              if (unauthorizedRecoverySteps > MAX_UNAUTHORIZED_RECOVERY_STEPS) {
+                throw new Error(`Exceeded maximum unauthorized recovery steps while requesting ${options.method} ${path}`);
+              }
               this.authorizationHeaderProfile = rotatedTo;
               attemptedAuthProfiles.add(rotatedTo);
               this.log.warn(`Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}. Retrying with alternate auth header profile: ${rotatedTo}.`);
@@ -1339,21 +1439,34 @@ export class SalusCloudClient {
               continue;
             }
 
-            const previousCompanyCode = this.activeCompanyCode;
-            const rotatedCompanyCode = this.rotateCompanyCodeCandidate(attemptedCompanyCodes, hintedCompanyCode);
-            if (companyCodeCandidateKey(rotatedCompanyCode) !== companyCodeCandidateKey(previousCompanyCode)) {
-              this.authorizationHeaderProfile = 'accessBearer';
-              attemptedAuthProfiles = new Set<AuthorizationHeaderProfile>([this.authorizationHeaderProfile]);
-              this.log.warn(
-                rotatedCompanyCode
-                  ? `Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}. Retrying with alternate company code header: ${rotatedCompanyCode}.`
-                  : `Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}. Retrying without company code header.`,
+            if (!isCompanyCodeMismatch) {
+              const previousCompanyCode = this.activeCompanyCode;
+              const rotatedCompanyCode = this.rotateCompanyCodeCandidate(attemptedCompanyCodes, hintedCompanyCode);
+              if (companyCodeCandidateKey(rotatedCompanyCode) !== companyCodeCandidateKey(previousCompanyCode)) {
+                unauthorizedRecoverySteps += 1;
+                if (unauthorizedRecoverySteps > MAX_UNAUTHORIZED_RECOVERY_STEPS) {
+                  throw new Error(`Exceeded maximum unauthorized recovery steps while requesting ${options.method} ${path}`);
+                }
+                this.authorizationHeaderProfile = 'accessBearer';
+                attemptedAuthProfiles = new Set<AuthorizationHeaderProfile>([this.authorizationHeaderProfile]);
+                this.log.warn(
+                  rotatedCompanyCode
+                    ? `Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}.`
+                      + ` Retrying with alternate company code header: ${rotatedCompanyCode}.`
+                    : `Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}. Retrying without company code header.`,
+                );
+                lastError = new HttpStatusError('Unauthorized', 401, responseText);
+                sawRetriableFailure = true;
+                lastRetriableError = lastError;
+                baseIndex -= 1;
+                continue;
+              }
+            }
+
+            if (isCompanyCodeMismatch) {
+              throw new LegacyFallbackRequiredError(
+                `Modern Salus API returned response_code=900008 on ${options.method} ${path} at ${baseUrl}.`,
               );
-              lastError = new HttpStatusError('Unauthorized', 401, responseText);
-              sawRetriableFailure = true;
-              lastRetriableError = lastError;
-              baseIndex -= 1;
-              continue;
             }
 
             const unauthorizedError = new HttpStatusError(
@@ -1897,10 +2010,14 @@ function normalizeNonEmptyString(value: string | undefined): string | undefined 
 function buildCompanyCodeCandidates(
   configuredCompanyCode: string | null,
   sessionCompanyCode: string | undefined,
+  region: SalusRegion | undefined,
 ): CompanyCodeCandidate[] {
   const normalizedConfigured = normalizeNonEmptyString(configuredCompanyCode ?? undefined) ?? null;
   const normalizedSession = normalizeNonEmptyString(sessionCompanyCode);
-  const fallbackCandidates = DEFAULT_COMPANY_CODE_FALLBACKS
+  const fallbackCandidates = dedupeStringArray([
+    ...buildRegionalCompanyCodeCandidates(region),
+    ...DEFAULT_COMPANY_CODE_FALLBACKS,
+  ])
     .map((value) => normalizeNonEmptyString(value))
     .filter((value): value is string => Boolean(value));
 
@@ -1920,6 +2037,26 @@ function buildCompanyCodeCandidates(
   }
 
   return deduped;
+}
+
+function buildRegionalCompanyCodeCandidates(region: SalusRegion | undefined): string[] {
+  if (region === 'us') {
+    return [
+      'salus-us',
+      'salus_us',
+      'salus',
+      'SALUS_US',
+      'SALUS',
+    ];
+  }
+
+  return [
+    'salus-eu',
+    'salus_eu',
+    'salus',
+    'SALUS_EU',
+    'SALUS',
+  ];
 }
 
 function companyCodeCandidateKey(candidate: CompanyCodeCandidate): string {
@@ -2096,8 +2233,11 @@ function extractCompanyCodeFromTokenClaims(...claimSets: Array<Record<string, un
     const candidates = [
       claims.companyCode,
       claims.company_code,
+      claims.company,
       claims['custom:companyCode'],
       claims['custom:company_code'],
+      claims['custom:company'],
+      claims['x-company-code'],
       claims.tenantCode,
       claims.tenant_code,
       claims.tenantId,
@@ -2329,6 +2469,7 @@ function inferShadowDsn(
 ): string | undefined {
   const direct = asString(record.dsn)
     ?? asString(record.device_dsn)
+    ?? asString(record.device_code)
     ?? asString(record.DSN);
   if (direct) {
     return direct;
@@ -2693,14 +2834,7 @@ function shouldSwitchToLegacyApi(error: unknown): boolean {
 
   if (error.status === 401 || error.status === 403) {
     const responseCode = extractServiceResponseCode(error.responseBody);
-    if (responseCode === '900008') {
-      return true;
-    }
-
-    const body = error.responseBody.toLowerCase();
-    if (body.includes('not authorized') || body.includes('unauthorized')) {
-      return true;
-    }
+    return responseCode === '900008';
   }
 
   return false;

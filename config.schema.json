@@ -95,7 +95,7 @@
       "companyCode": {
         "title": "Advanced: Company Code Header",
         "type": "string",
-        "description": "Optional x-company-code header for partner-branded Salus tenants."
+        "description": "Optional x-company-code header override (for example salus-eu, salus-us, heatlink_us)."
       },
       "pollIntervalSeconds": {
         "title": "Polling Interval (seconds)",
