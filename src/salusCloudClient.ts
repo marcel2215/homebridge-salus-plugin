@@ -71,6 +71,12 @@ class LegacyFallbackRequiredError extends Error {
   }
 }
 
+class OccupantsDiscoveryEmptyError extends Error {
+  constructor(message: string) {
+    super(message);
+  }
+}
+
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_BASE_DELAY_MS = 750;
 const MAX_RETRY_DELAY_MS = 60_000;
@@ -374,7 +380,7 @@ export class SalusCloudClient {
 
     const devices = dedupeDevicesByDsn(discoveredDevices);
     if (devices.length === 0) {
-      throw new Error('Occupants discovery returned no devices.');
+      throw new OccupantsDiscoveryEmptyError('Occupants discovery returned no devices.');
     }
     this.rebuildDeviceIndex(devices);
 
@@ -2920,6 +2926,9 @@ function shouldSwitchToLegacyApi(error: unknown): boolean {
 }
 
 function shouldTryAlternateDiscovery(error: unknown): boolean {
+  if (error instanceof OccupantsDiscoveryEmptyError) {
+    return true;
+  }
   if (error instanceof HttpStatusError) {
     return true;
   }
