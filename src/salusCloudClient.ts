@@ -270,6 +270,29 @@ export class SalusCloudClient {
   }
 
   private async listDevicesModern(): Promise<SalusDevice[]> {
+    let lastError: unknown;
+
+    try {
+      return await this.listDevicesViaOccupantsEndpoints();
+    } catch (error) {
+      lastError = error;
+      if (!shouldTryAlternateDiscovery(error)) {
+        throw error;
+      }
+      this.log.warn(`AWS occupants discovery failed. Falling back to /devices endpoint (${asErrorMessage(error)})`);
+    }
+
+    try {
+      return await this.listDevicesViaDevicesEndpoint();
+    } catch (error) {
+      if (this.verboseLogging) {
+        this.log.debug(`Fallback /devices discovery failed: ${asErrorMessage(error)}`);
+      }
+      throw error ?? lastError;
+    }
+  }
+
+  private async listDevicesViaDevicesEndpoint(): Promise<SalusDevice[]> {
     const payload = await this.requestServiceJsonWithPathFallback<unknown>(
       ['/devices/', '/devices'],
       {
@@ -300,7 +323,90 @@ export class SalusCloudClient {
     }
 
     if (this.verboseLogging) {
-      this.log.debug(`Salus cloud returned ${devices.length} device(s)`);
+      this.log.debug(`Salus cloud returned ${devices.length} device(s) from /devices endpoint`);
+    }
+
+    return devices;
+  }
+
+  private async listDevicesViaOccupantsEndpoints(): Promise<SalusDevice[]> {
+    const gatewayListPayload = await this.requestServiceJsonWithPathFallback<unknown>(
+      ['/api/v1/occupants/slider_list', '/occupants/slider_list'],
+      {
+        method: 'GET',
+        auth: true,
+      },
+    );
+
+    const gatewayIds = parseGatewayIdsFromOccupantsPayload(gatewayListPayload);
+    const mergedShadows: Map<string, SalusPropertyMap> = new Map();
+    const discoveredDevices: SalusDevice[] = [];
+
+    if (gatewayIds.length > 0) {
+      for (const gatewayId of gatewayIds) {
+        const detailsPayload = await this.requestServiceJsonWithPathFallback<unknown>(
+          [
+            `/api/v1/occupants/slider_details?id=${encodeURIComponent(gatewayId)}&type=gateway`,
+            `/occupants/slider_details?id=${encodeURIComponent(gatewayId)}&type=gateway`,
+          ],
+          {
+            method: 'GET',
+            auth: true,
+          },
+        );
+
+        discoveredDevices.push(...parseDevices(detailsPayload));
+        const detailShadows = parseDeviceShadows(detailsPayload, this.deviceIdToDsn, this.deviceKeyToDsn);
+        for (const [dsn, properties] of detailShadows) {
+          const existing = mergedShadows.get(dsn);
+          if (existing) {
+            mergePropertyMaps(existing, properties);
+          } else {
+            mergedShadows.set(dsn, properties);
+          }
+        }
+      }
+    } else {
+      discoveredDevices.push(...parseDevices(gatewayListPayload));
+      const listShadows = parseDeviceShadows(gatewayListPayload, this.deviceIdToDsn, this.deviceKeyToDsn);
+      for (const [dsn, properties] of listShadows) {
+        mergedShadows.set(dsn, properties);
+      }
+    }
+
+    const devices = dedupeDevicesByDsn(discoveredDevices);
+    if (devices.length === 0) {
+      throw new Error('Occupants discovery returned no devices.');
+    }
+    this.rebuildDeviceIndex(devices);
+
+    if (mergedShadows.size > 0) {
+      this.mergeIntoPropertyCache(mergedShadows);
+      if (this.verboseLogging) {
+        this.log.debug(`Hydrated property cache from occupants payload for ${mergedShadows.size} device(s)`);
+      }
+    }
+
+    try {
+      const shadowPayload = await this.fetchDeviceShadows(devices);
+      if (shadowPayload.size > 0) {
+        this.mergeIntoPropertyCache(shadowPayload);
+        if (this.verboseLogging) {
+          this.log.debug(`Hydrated property cache from devices/device_shadows for ${shadowPayload.size} device(s)`);
+        }
+      } else if (devices.length > 0 && mergedShadows.size === 0) {
+        this.log.warn('No property payload was returned by devices/device_shadows. Accessory states may stay stale until Salus API responds.');
+      }
+    } catch (error) {
+      if (shouldTryAlternateDiscovery(error)) {
+        this.log.warn(`Device shadow query failed after occupants discovery (${asErrorMessage(error)}). Continuing with available data.`);
+      } else {
+        throw error;
+      }
+    }
+
+    if (this.verboseLogging) {
+      this.log.debug(`Salus cloud returned ${devices.length} device(s) from occupants endpoints`);
     }
 
     return devices;
@@ -940,6 +1046,9 @@ export class SalusCloudClient {
       return candidate;
     }
 
+    // No candidate remains; explicitly clear active code so callers can detect
+    // that no further company-code rotation is possible.
+    this.activeCompanyCode = null;
     return null;
   }
 
@@ -1733,10 +1842,11 @@ export class SalusCloudClient {
       throw new Error('Missing Salus cloud session while building authenticated request.');
     }
 
-    const authToken = tokenForAuthorizationProfile(this.authorizationHeaderProfile, this.session.accessToken, this.session.idToken);
     headers.Authorization = formatAuthorizationHeader(this.authorizationHeaderProfile, this.session.accessToken, this.session.idToken);
+    // The Salus AWS service-api expects this exact token pair:
+    // x-access-token = access token, x-auth-token = id token.
     headers['x-access-token'] = this.session.accessToken;
-    headers['x-auth-token'] = authToken;
+    headers['x-auth-token'] = this.session.idToken;
     const companyCode = this.activeCompanyCode;
     if (companyCode) {
       headers['x-company-code'] = companyCode;
@@ -2063,17 +2173,6 @@ function companyCodeCandidateKey(candidate: CompanyCodeCandidate): string {
   return candidate ?? NO_COMPANY_CODE_SENTINEL;
 }
 
-function tokenForAuthorizationProfile(
-  profile: AuthorizationHeaderProfile,
-  accessToken: string,
-  idToken: string,
-): string {
-  if (profile === 'idBearer' || profile === 'idRaw') {
-    return idToken;
-  }
-  return accessToken;
-}
-
 function extractServiceResponseCode(responseText: string): string | undefined {
   if (!responseText) {
     return undefined;
@@ -2304,6 +2403,32 @@ function parseCognitoErrorMessage(responseBody: string): string {
   }
 }
 
+function parseGatewayIdsFromOccupantsPayload(payload: unknown): string[] {
+  const root = asRecord(payload);
+  if (!root) {
+    return [];
+  }
+
+  const data = asArray(root.data) ?? asArray(root.results) ?? asArray(root.list);
+  if (!data) {
+    return [];
+  }
+
+  const ids: string[] = [];
+  for (const entry of data) {
+    const record = asRecord(entry);
+    const id = asString(record?.id)
+      ?? asString(record?.gateway_id)
+      ?? asString(record?.gatewayId);
+    if (!id) {
+      continue;
+    }
+    ids.push(id);
+  }
+
+  return dedupeStringArray(ids);
+}
+
 function parseDevices(payload: unknown): SalusDevice[] {
   const root = asRecord(payload);
   const candidates: unknown[][] = [];
@@ -2350,6 +2475,7 @@ function parseDevices(payload: unknown): SalusDevice[] {
 
       const dsn = asString(normalized.dsn)
         ?? asString(normalized.device_dsn)
+        ?? asString(normalized.device_code)
         ?? asString(normalized.DSN);
       if (!dsn) {
         continue;
@@ -2363,6 +2489,7 @@ function parseDevices(payload: unknown): SalusDevice[] {
 
       const modelRaw = asString(normalized.oem_model)
         ?? asString(normalized.model)
+        ?? asString(normalized.model_name)
         ?? asString(normalized.product_class)
         ?? asString(normalized.device_model)
         ?? '';
@@ -2838,6 +2965,13 @@ function shouldSwitchToLegacyApi(error: unknown): boolean {
   }
 
   return false;
+}
+
+function shouldTryAlternateDiscovery(error: unknown): boolean {
+  if (error instanceof HttpStatusError) {
+    return true;
+  }
+  return isRetriableFailure(error);
 }
 
 function isRetriableStatus(status: number): boolean {

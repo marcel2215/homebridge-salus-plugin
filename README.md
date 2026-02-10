@@ -23,7 +23,7 @@ The plugin follows the app's modern cloud stack:
 - Refresh flow: `REFRESH_TOKEN_AUTH`
 - Service API base (EU default): `https://service-api.eu.premium.salusconnect.io/api/v1`
 - Service API fallback: `/api/v2`
-- Discovery endpoint: `GET /devices/`
+- Discovery endpoints (in order): `GET /api/v1/occupants/slider_list` + `GET /api/v1/occupants/slider_details?id=...&type=gateway`, then fallback `GET /devices/`
 - Property shadow endpoint: `GET/POST /devices/device_shadows`
 - Control write endpoint (primary): `POST /devices/bulk` (with fallback payload shapes)
 
@@ -94,6 +94,7 @@ Examples:
 - Automatic token refresh before expiry and on `401` responses.
 - Exponential backoff retries for transient network/API failures.
 - API base fallback between `/api/v1` and `/api/v2`.
+- Modern discovery fallback from `occupants` API to legacy `/devices` API shape.
 - Automatic compatibility fallback to legacy Salus cloud auth/API (multi-path legacy sign-in probe + `/apiv1`) when modern API returns persistent authorization errors (for example `response_code=900008`).
 - Flexible shadow parser for multiple payload shapes.
 - Flexible write payload fallback for service-api compatibility changes.
@@ -102,7 +103,7 @@ Examples:
 
 ## 900008 troubleshooting
 
-If logs show `response_code=900008` from modern `service-api`, the plugin now first exhausts modern auth recovery (token refresh, auth-header profile rotation, and expanded `x-company-code` permutations including `salus-eu` / `salus-us`) before switching to legacy compatibility mode.
+If logs show `response_code=900008` from modern `service-api`, the plugin now first validates the Salus AWS token-header pair (`x-access-token` = access token, `x-auth-token` = id token), then exhausts modern auth recovery (token refresh, auth-header profile rotation, and expanded `x-company-code` permutations including `salus-eu` / `salus-us`) before switching to legacy compatibility mode.
 
 If legacy fallback is required, you will see:
 
