@@ -69,7 +69,7 @@ homebridge -D
 - `apiVersionPreference`: `auto`, `v1`, or `v2`.
 - `cognitoRegion`: Override AWS Cognito region.
 - `cognitoClientId`: Override Cognito app client ID.
-- `companyCode`: Optional `x-company-code` override (for example `salus-eu`, `salus-us`, `heatlink_us`).
+- `companyCode`: Optional `x-company-code` override (for example `salus-eu`, `salus-us`, `heatlink_us`). If omitted, the plugin now starts with region defaults (`salus-eu` / `salus-us`) and only then tries alternatives.
 - `allowInsecureTls`: Only for certificate troubleshooting (not recommended long-term).
 
 ## Device mapping
@@ -103,7 +103,7 @@ Examples:
 
 ## 900008 troubleshooting
 
-If logs show `response_code=900008` from modern `service-api`, the plugin now first validates the Salus AWS token-header pair (`x-access-token` = access token, `x-auth-token` = id token), then exhausts modern auth recovery (token refresh, auth-header profile rotation, and expanded `x-company-code` permutations including `salus-eu` / `salus-us`) before switching to legacy compatibility mode.
+If logs show `response_code=900008` from modern `service-api`, the plugin now uses the same modern header model as the Salus AWS flow (`x-access-token` = access token, `x-auth-token` = id token, `x-company-code`), retries with refreshed tokens, and rotates company-code candidates before switching to legacy compatibility mode.
 
 If legacy fallback is required, you will see:
 

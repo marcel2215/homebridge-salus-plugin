@@ -52,7 +52,6 @@ interface WriteAttempt {
   description: string;
 }
 
-type AuthorizationHeaderProfile = 'accessBearer' | 'idBearer' | 'accessRaw' | 'idRaw';
 type CompanyCodeCandidate = string | null;
 type ApiTransportMode = 'modern' | 'legacy';
 
@@ -92,7 +91,7 @@ const ACCEPT_LANGUAGE = 'en-US,en;q=0.9,en;q=0.8';
 const SESSION_REFRESH_SAFETY_MS = 60_000;
 const LEGACY_SESSION_REFRESH_SAFETY_MS = 60_000;
 const LEGACY_DEFAULT_SESSION_TTL_MS = 45 * 60_000;
-const MAX_UNAUTHORIZED_RECOVERY_STEPS = 120;
+const MAX_UNAUTHORIZED_RECOVERY_STEPS = 48;
 
 const STATUS_ALLOW_PATH_FALLBACK = new Set([404, 405, 426]);
 const STATUS_ALLOW_WRITE_SHAPE_FALLBACK = new Set([400, 404, 405, 409, 415, 422]);
@@ -206,7 +205,6 @@ export class SalusCloudClient {
   private insecureTlsInFlight = 0;
   private insecureTlsPreviousValue: string | undefined;
   private insecureTlsHadPreviousValue = false;
-  private authorizationHeaderProfile: AuthorizationHeaderProfile = 'accessBearer';
 
   constructor(
     private readonly log: Logging,
@@ -331,7 +329,7 @@ export class SalusCloudClient {
 
   private async listDevicesViaOccupantsEndpoints(): Promise<SalusDevice[]> {
     const gatewayListPayload = await this.requestServiceJsonWithPathFallback<unknown>(
-      ['/api/v1/occupants/slider_list', '/occupants/slider_list'],
+      ['/occupants/slider_list', '/api/v1/occupants/slider_list'],
       {
         method: 'GET',
         auth: true,
@@ -346,8 +344,8 @@ export class SalusCloudClient {
       for (const gatewayId of gatewayIds) {
         const detailsPayload = await this.requestServiceJsonWithPathFallback<unknown>(
           [
-            `/api/v1/occupants/slider_details?id=${encodeURIComponent(gatewayId)}&type=gateway`,
             `/occupants/slider_details?id=${encodeURIComponent(gatewayId)}&type=gateway`,
+            `/api/v1/occupants/slider_details?id=${encodeURIComponent(gatewayId)}&type=gateway`,
           ],
           {
             method: 'GET',
@@ -667,7 +665,6 @@ export class SalusCloudClient {
 
     this.apiTransportMode = 'legacy';
     this.activeServiceApiBaseUrl = null;
-    this.authorizationHeaderProfile = 'accessBearer';
     this.session = null;
     this.authRequestInFlight = null;
     this.hasWarnedAboutAuthCompanyCode = false;
@@ -1452,7 +1449,6 @@ export class SalusCloudClient {
     const totalAttempts = this.maxRetries + 1;
 
     let hasRefreshedSessionAfter401 = false;
-    let attemptedAuthProfiles = new Set<AuthorizationHeaderProfile>([this.authorizationHeaderProfile]);
     const attemptedCompanyCodes = new Set<string>([companyCodeCandidateKey(this.activeCompanyCode)]);
     let unauthorizedRecoverySteps = 0;
     let lastError: unknown = new Error(`No Salus cloud response received for ${options.method} ${path}`);
@@ -1516,8 +1512,6 @@ export class SalusCloudClient {
                 if (unauthorizedRecoverySteps > MAX_UNAUTHORIZED_RECOVERY_STEPS) {
                   throw new Error(`Exceeded maximum unauthorized recovery steps while requesting ${options.method} ${path}`);
                 }
-                this.authorizationHeaderProfile = 'accessBearer';
-                attemptedAuthProfiles = new Set<AuthorizationHeaderProfile>([this.authorizationHeaderProfile]);
                 this.log.warn(
                   rotatedCompanyCode
                     ? `Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}.`
@@ -1532,22 +1526,6 @@ export class SalusCloudClient {
               }
             }
 
-            const rotatedTo = rotateAuthorizationHeaderProfile(this.authorizationHeaderProfile);
-            if (rotatedTo !== this.authorizationHeaderProfile && !attemptedAuthProfiles.has(rotatedTo)) {
-              unauthorizedRecoverySteps += 1;
-              if (unauthorizedRecoverySteps > MAX_UNAUTHORIZED_RECOVERY_STEPS) {
-                throw new Error(`Exceeded maximum unauthorized recovery steps while requesting ${options.method} ${path}`);
-              }
-              this.authorizationHeaderProfile = rotatedTo;
-              attemptedAuthProfiles.add(rotatedTo);
-              this.log.warn(`Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}. Retrying with alternate auth header profile: ${rotatedTo}.`);
-              lastError = new HttpStatusError('Unauthorized', 401, responseText);
-              sawRetriableFailure = true;
-              lastRetriableError = lastError;
-              baseIndex -= 1;
-              continue;
-            }
-
             if (!isCompanyCodeMismatch) {
               const previousCompanyCode = this.activeCompanyCode;
               const rotatedCompanyCode = this.rotateCompanyCodeCandidate(attemptedCompanyCodes, hintedCompanyCode);
@@ -1556,8 +1534,6 @@ export class SalusCloudClient {
                 if (unauthorizedRecoverySteps > MAX_UNAUTHORIZED_RECOVERY_STEPS) {
                   throw new Error(`Exceeded maximum unauthorized recovery steps while requesting ${options.method} ${path}`);
                 }
-                this.authorizationHeaderProfile = 'accessBearer';
-                attemptedAuthProfiles = new Set<AuthorizationHeaderProfile>([this.authorizationHeaderProfile]);
                 this.log.warn(
                   rotatedCompanyCode
                     ? `Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}.`
@@ -1842,7 +1818,6 @@ export class SalusCloudClient {
       throw new Error('Missing Salus cloud session while building authenticated request.');
     }
 
-    headers.Authorization = formatAuthorizationHeader(this.authorizationHeaderProfile, this.session.accessToken, this.session.idToken);
     // The Salus AWS service-api expects this exact token pair:
     // x-access-token = access token, x-auth-token = id token.
     headers['x-access-token'] = this.session.accessToken;
@@ -2131,13 +2106,16 @@ function buildCompanyCodeCandidates(
     .map((value) => normalizeNonEmptyString(value))
     .filter((value): value is string => Boolean(value));
 
-  const initialCandidates: CompanyCodeCandidate[] = normalizedConfigured
-    ? [normalizedConfigured, normalizedSession ?? null, null]
-    : [normalizedSession ?? null, null];
+  const initialCandidates = [
+    normalizedConfigured,
+    normalizedSession,
+  ]
+    .map((value) => normalizeNonEmptyString(value ?? undefined))
+    .filter((value): value is string => Boolean(value));
 
   const seen = new Set<string>();
   const deduped: CompanyCodeCandidate[] = [];
-  for (const candidate of [...initialCandidates, ...fallbackCandidates]) {
+  for (const candidate of [...initialCandidates, ...fallbackCandidates, null]) {
     const key = companyCodeCandidateKey(candidate);
     if (seen.has(key)) {
       continue;
@@ -2295,32 +2273,6 @@ function parseLegacyTokens(payload: unknown): LegacySession | undefined {
   }
 
   return undefined;
-}
-
-function formatAuthorizationHeader(
-  profile: AuthorizationHeaderProfile,
-  accessToken: string,
-  idToken: string,
-): string {
-  if (profile === 'idBearer') {
-    return `Bearer ${idToken}`;
-  }
-  if (profile === 'accessRaw') {
-    return accessToken;
-  }
-  if (profile === 'idRaw') {
-    return idToken;
-  }
-  return `Bearer ${accessToken}`;
-}
-
-function rotateAuthorizationHeaderProfile(current: AuthorizationHeaderProfile): AuthorizationHeaderProfile {
-  const order: AuthorizationHeaderProfile[] = ['accessBearer', 'idBearer', 'accessRaw', 'idRaw'];
-  const index = order.indexOf(current);
-  if (index === -1) {
-    return order[0]!;
-  }
-  return order[(index + 1) % order.length]!;
 }
 
 function extractCompanyCodeFromTokenClaims(...claimSets: Array<Record<string, unknown> | undefined>): string | undefined {
