@@ -170,8 +170,14 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
             const profile = this.deriveProfile(device, properties);
             return { device, properties, profile };
           } catch (error) {
-            this.log.error(`Failed to fetch properties for ${device.name} (${device.dsn}): ${asErrorMessage(error)}`);
-            return null;
+            const cachedFallback = this.cloudClient!.getCachedProperties(device.dsn);
+            const fallbackProperties = cachedFallback ?? new Map();
+            const profile = this.deriveProfile(device, fallbackProperties);
+            this.log.warn(
+              `Property sync degraded for ${device.name} (${device.dsn}): ${asErrorMessage(error)}.`
+              + ` Continuing with ${cachedFallback ? 'cached' : 'empty'} properties.`,
+            );
+            return { device, properties: fallbackProperties, profile };
           }
         },
       );

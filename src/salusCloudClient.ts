@@ -220,6 +220,9 @@ export class SalusCloudClient {
   private readonly propertyCacheByDsn: Map<string, SalusPropertyMap> = new Map();
   private readonly deviceIdToDsn: Map<string, string> = new Map();
   private readonly deviceKeyToDsn: Map<string, string> = new Map();
+  private readonly blockedSliderDetailsTargetIds: Set<string> = new Set();
+  private readonly blockedPropertyShadowDsns: Set<string> = new Set();
+  private hasWarnedAboutSliderDetailsAuthFailure = false;
   private preferredShadowVariantDescription: string | null = null;
   private readonly preferredWriteAttemptByKey: Map<string, string> = new Map();
   private insecureTlsInFlight = 0;
@@ -268,6 +271,10 @@ export class SalusCloudClient {
       return this.activeLegacyApiBaseUrl ?? this.legacyApiBaseCandidates[0]!;
     }
     return this.activeServiceApiBaseUrl ?? this.serviceApiBaseCandidates[0]!;
+  }
+
+  public getCachedProperties(dsn: string): SalusPropertyMap | undefined {
+    return this.propertyCacheByDsn.get(dsn);
   }
 
   public async listDevices(): Promise<SalusDevice[]> {
@@ -327,6 +334,7 @@ export class SalusCloudClient {
 
     const devices = parseDevices(payload);
     this.rebuildDeviceIndex(devices);
+    const inlinePropertiesFromRecords = this.hydratePropertyCacheFromDeviceRecords(devices, '/devices payload');
 
     const inlineShadows = parseDeviceShadows(payload, this.deviceIdToDsn, this.deviceKeyToDsn);
     if (inlineShadows.size > 0) {
@@ -342,7 +350,7 @@ export class SalusCloudClient {
       if (this.verboseLogging) {
         this.log.debug(`Hydrated property cache from devices/device_shadows for ${shadowPayload.size} device(s)`);
       }
-    } else if (devices.length > 0 && inlineShadows.size === 0) {
+    } else if (devices.length > 0 && inlineShadows.size === 0 && inlinePropertiesFromRecords === 0) {
       this.log.warn('No property payload was returned by devices/device_shadows. Accessory states may stay stale until Salus API responds.');
     }
 
@@ -356,6 +364,7 @@ export class SalusCloudClient {
   private async listDevicesViaOccupantsEndpoints(): Promise<SalusDevice[]> {
     const mergedShadows: Map<string, SalusPropertyMap> = new Map();
     const discoveredDevices: SalusDevice[] = [];
+    const occupantsPayloads: unknown[] = [];
     const targetQueue: OccupantsSliderTarget[] = [];
     const queuedTargets = new Set<string>();
 
@@ -393,6 +402,7 @@ export class SalusCloudClient {
             auth: true,
           },
         );
+        occupantsPayloads.push(sliderListPayload);
         discoveredDevices.push(...parseDevices(sliderListPayload));
         mergeShadowsFromPayload(sliderListPayload);
         addTargets(extractOccupantsSliderTargets(sliderListPayload));
@@ -433,6 +443,7 @@ export class SalusCloudClient {
 
       const detailPayloads = await this.fetchOccupantsSliderDetailsPayloads(nextTarget);
       for (const detailPayload of detailPayloads) {
+        occupantsPayloads.push(detailPayload);
         discoveredDevices.push(...parseDevices(detailPayload));
         mergeShadowsFromPayload(detailPayload);
         addTargets(extractOccupantsSliderTargets(detailPayload));
@@ -444,6 +455,30 @@ export class SalusCloudClient {
       throw new OccupantsDiscoveryEmptyError('Occupants discovery returned no devices.');
     }
     this.rebuildDeviceIndex(devices);
+    const inlinePropertiesFromRecords = this.hydratePropertyCacheFromDeviceRecords(devices, 'occupants payload device records');
+
+    // Re-parse all occupants payloads after rebuilding device id->dsn indexes.
+    // Some tenants only return device_id/device_key in slider payloads.
+    const indexedPayloadShadows: Map<string, SalusPropertyMap> = new Map();
+    for (const payload of occupantsPayloads) {
+      const parsed = parseDeviceShadows(payload, this.deviceIdToDsn, this.deviceKeyToDsn);
+      for (const [dsn, properties] of parsed) {
+        const existing = indexedPayloadShadows.get(dsn);
+        if (existing) {
+          mergePropertyMaps(existing, properties);
+        } else {
+          indexedPayloadShadows.set(dsn, properties);
+        }
+      }
+    }
+    for (const [dsn, properties] of indexedPayloadShadows) {
+      const existing = mergedShadows.get(dsn);
+      if (existing) {
+        mergePropertyMaps(existing, properties);
+      } else {
+        mergedShadows.set(dsn, properties);
+      }
+    }
 
     if (mergedShadows.size > 0) {
       this.mergeIntoPropertyCache(mergedShadows);
@@ -459,11 +494,11 @@ export class SalusCloudClient {
         if (this.verboseLogging) {
           this.log.debug(`Hydrated property cache from devices/device_shadows for ${shadowPayload.size} device(s)`);
         }
-      } else if (devices.length > 0 && mergedShadows.size === 0) {
+      } else if (devices.length > 0 && mergedShadows.size === 0 && inlinePropertiesFromRecords === 0) {
         this.log.warn('No property payload was returned by devices/device_shadows. Accessory states may stay stale until Salus API responds.');
       }
     } catch (error) {
-      if (shouldTryAlternateDiscovery(error)) {
+      if (shouldTryAlternateDiscovery(error) || error instanceof LegacyFallbackRequiredError) {
         this.log.warn(`Device shadow query failed after occupants discovery (${asErrorMessage(error)}). Continuing with available data.`);
       } else {
         throw error;
@@ -478,6 +513,11 @@ export class SalusCloudClient {
   }
 
   private async fetchOccupantsSliderDetailsPayloads(target: OccupantsSliderTarget): Promise<unknown[]> {
+    const normalizedTargetId = target.id.trim();
+    if (!normalizedTargetId || this.blockedSliderDetailsTargetIds.has(normalizedTargetId)) {
+      return [];
+    }
+
     const payloads: unknown[] = [];
     const pathGroups = buildSliderDetailsPathGroups(target.id, target.typeHints);
     let lastError: unknown;
@@ -498,6 +538,26 @@ export class SalusCloudClient {
         }
       } catch (error) {
         lastError = error;
+        if (error instanceof LegacyFallbackRequiredError) {
+          this.blockedSliderDetailsTargetIds.add(normalizedTargetId);
+          if (!this.hasWarnedAboutSliderDetailsAuthFailure) {
+            this.hasWarnedAboutSliderDetailsAuthFailure = true;
+            this.log.warn(
+              `Salus cloud denied /occupants/slider_details for id=${normalizedTargetId}.`
+              + ' Continuing with slider_list discovery only and skipping restricted slider_details targets.',
+            );
+          } else if (this.verboseLogging) {
+            this.log.debug(`Skipping restricted /occupants/slider_details target id=${normalizedTargetId}.`);
+          }
+          return payloads;
+        }
+        if (error instanceof HttpStatusError && (error.status === 401 || error.status === 403)) {
+          this.blockedSliderDetailsTargetIds.add(normalizedTargetId);
+          if (this.verboseLogging) {
+            this.log.debug(`Skipping unauthorized /occupants/slider_details target id=${normalizedTargetId}.`);
+          }
+          return payloads;
+        }
         if (error instanceof HttpStatusError && STATUS_ALLOW_OCCUPANTS_VARIANT_FALLBACK.has(error.status)) {
           continue;
         }
@@ -531,6 +591,7 @@ export class SalusCloudClient {
 
     const devices = parseDevices(payload);
     this.rebuildDeviceIndex(devices);
+    const inlinePropertiesFromRecords = this.hydratePropertyCacheFromDeviceRecords(devices, 'legacy /apiv1/devices payload');
 
     const inlineShadows = parseDeviceShadows(payload, this.deviceIdToDsn, this.deviceKeyToDsn);
     if (inlineShadows.size > 0) {
@@ -538,6 +599,8 @@ export class SalusCloudClient {
       if (this.verboseLogging) {
         this.log.debug(`Hydrated property cache from legacy /apiv1/devices response for ${inlineShadows.size} device(s)`);
       }
+    } else if (inlinePropertiesFromRecords > 0 && this.verboseLogging) {
+      this.log.debug(`Legacy payload contained inline properties for ${inlinePropertiesFromRecords} device(s).`);
     }
 
     if (this.verboseLogging) {
@@ -563,16 +626,35 @@ export class SalusCloudClient {
       if (!shouldSwitchToLegacyApi(error)) {
         throw error;
       }
+      const cachedAfterFailure = this.propertyCacheByDsn.get(dsn);
+      if (cachedAfterFailure) {
+        if (this.verboseLogging) {
+          this.log.debug(`Using cached properties for ${dsn} after restricted property sync (${asErrorMessage(error)}).`);
+        }
+        return cachedAfterFailure;
+      }
 
-      this.switchToLegacyTransport(`Modern Salus property sync failed for ${dsn}: ${asErrorMessage(error)}`);
-      return await this.listPropertiesLegacy(dsn);
+      if (!this.blockedPropertyShadowDsns.has(dsn)) {
+        this.blockedPropertyShadowDsns.add(dsn);
+        this.log.warn(
+          `Salus cloud denied direct property sync for ${dsn} (${asErrorMessage(error)}).`
+          + ' Continuing discovery using available occupants/device payload data.',
+        );
+      }
+
+      return new Map();
     }
   }
 
   private async listPropertiesModern(dsn: string): Promise<SalusPropertyMap> {
+    if (this.blockedPropertyShadowDsns.has(dsn)) {
+      return this.propertyCacheByDsn.get(dsn) ?? new Map();
+    }
+
     const shadows = await this.fetchDeviceShadows([], [dsn]);
     const fromFetch = shadows.get(dsn);
     if (fromFetch) {
+      this.blockedPropertyShadowDsns.delete(dsn);
       this.propertyCacheByDsn.set(dsn, fromFetch);
       return fromFetch;
     }
@@ -2046,6 +2128,19 @@ export class SalusCloudClient {
       }
     }
   }
+
+  private hydratePropertyCacheFromDeviceRecords(devices: SalusDevice[], sourceLabel: string): number {
+    const parsed = extractInlinePropertiesFromDeviceRecords(devices);
+    if (parsed.size === 0) {
+      return 0;
+    }
+
+    this.mergeIntoPropertyCache(parsed);
+    if (this.verboseLogging) {
+      this.log.debug(`Hydrated property cache from ${sourceLabel} for ${parsed.size} device(s).`);
+    }
+    return parsed.size;
+  }
 }
 
 function buildServiceApiBaseCandidates(
@@ -2738,6 +2833,26 @@ function parseDevices(payload: unknown): SalusDevice[] {
   }
 
   return dedupeDevicesByDsn(result);
+}
+
+function extractInlinePropertiesFromDeviceRecords(devices: SalusDevice[]): Map<string, SalusPropertyMap> {
+  const output: Map<string, SalusPropertyMap> = new Map();
+
+  for (const device of devices) {
+    const parsed = parseProperties(device.raw);
+    if (parsed.size === 0) {
+      continue;
+    }
+
+    const existing = output.get(device.dsn);
+    if (existing) {
+      mergePropertyMaps(existing, parsed);
+    } else {
+      output.set(device.dsn, parsed);
+    }
+  }
+
+  return output;
 }
 
 function parseDeviceRecord(record: Record<string, unknown>): SalusDevice | undefined {
