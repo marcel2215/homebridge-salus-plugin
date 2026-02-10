@@ -2,7 +2,7 @@
   "name": "homebridge-salus-cloud",
   "displayName": "Salus Cloud",
   "type": "module",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "Cloud-only Salus Connect Homebridge platform with automatic discovery and HomeKit control.",
   "author": "Marcel",
   "license": "Apache-2.0",

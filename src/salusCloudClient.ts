@@ -52,6 +52,11 @@ interface WriteAttempt {
   description: string;
 }
 
+interface OccupantsSliderTarget {
+  id: string;
+  typeHints: string[];
+}
+
 type CompanyCodeCandidate = string | null;
 type ApiTransportMode = 'modern' | 'legacy';
 
@@ -101,6 +106,7 @@ const MAX_UNAUTHORIZED_RECOVERY_STEPS = 48;
 
 const STATUS_ALLOW_PATH_FALLBACK = new Set([404, 405, 426]);
 const STATUS_ALLOW_WRITE_SHAPE_FALLBACK = new Set([400, 404, 405, 409, 415, 422]);
+const STATUS_ALLOW_OCCUPANTS_VARIANT_FALLBACK = new Set([400, 404, 405, 422]);
 const DEFAULT_EXPECTED_STATUSES = [200, 201, 202, 204];
 const RETRIABLE_ERROR_CODES = new Set([
   'ABORT_ERR',
@@ -150,6 +156,14 @@ const LEGACY_LOGIN_PATH_CANDIDATES = [
   '/apiv1/users/sign_in',
 ];
 const NO_COMPANY_CODE_SENTINEL = '__none__';
+const OCCUPANTS_SLIDER_LIST_PATH_GROUPS = [
+  ['/occupants/slider_list', '/api/v1/occupants/slider_list'],
+  ['/occupants/slider_list?type=gateway', '/api/v1/occupants/slider_list?type=gateway'],
+  ['/occupants/slider_list?type=occupant', '/api/v1/occupants/slider_list?type=occupant'],
+  ['/occupants/slider_list?type=home', '/api/v1/occupants/slider_list?type=home'],
+  ['/occupants/slider_list?type=site', '/api/v1/occupants/slider_list?type=site'],
+];
+const OCCUPANTS_SLIDER_DETAIL_TYPE_FALLBACKS = ['gateway', 'occupant', 'home', 'house', 'site', 'group', 'location', 'zone', 'room'];
 
 const METADATA_FIELD_NAMES = new Set([
   'id',
@@ -289,6 +303,12 @@ export class SalusCloudClient {
     try {
       return await this.listDevicesViaDevicesEndpoint();
     } catch (error) {
+      if (lastError instanceof OccupantsDiscoveryEmptyError && error instanceof LegacyFallbackRequiredError) {
+        // Tenants discovered via occupants APIs can reject /devices with 900008.
+        // Keep using modern mode and report the occupants-discovery failure instead
+        // of forcing an unrelated legacy fallback.
+        throw lastError;
+      }
       if (this.verboseLogging) {
         this.log.debug(`Fallback /devices discovery failed: ${asErrorMessage(error)}`);
       }
@@ -334,47 +354,88 @@ export class SalusCloudClient {
   }
 
   private async listDevicesViaOccupantsEndpoints(): Promise<SalusDevice[]> {
-    const gatewayListPayload = await this.requestServiceJsonWithPathFallback<unknown>(
-      ['/occupants/slider_list', '/api/v1/occupants/slider_list'],
-      {
-        method: 'GET',
-        auth: true,
-      },
-    );
-
-    const gatewayIds = parseGatewayIdsFromOccupantsPayload(gatewayListPayload);
     const mergedShadows: Map<string, SalusPropertyMap> = new Map();
     const discoveredDevices: SalusDevice[] = [];
+    const targetQueue: OccupantsSliderTarget[] = [];
+    const queuedTargets = new Set<string>();
 
-    if (gatewayIds.length > 0) {
-      for (const gatewayId of gatewayIds) {
-        const detailsPayload = await this.requestServiceJsonWithPathFallback<unknown>(
-          [
-            `/occupants/slider_details?id=${encodeURIComponent(gatewayId)}&type=gateway`,
-            `/api/v1/occupants/slider_details?id=${encodeURIComponent(gatewayId)}&type=gateway`,
-          ],
+    const mergeShadowsFromPayload = (payload: unknown): void => {
+      const parsed = parseDeviceShadows(payload, this.deviceIdToDsn, this.deviceKeyToDsn);
+      for (const [dsn, properties] of parsed) {
+        const existing = mergedShadows.get(dsn);
+        if (existing) {
+          mergePropertyMaps(existing, properties);
+        } else {
+          mergedShadows.set(dsn, properties);
+        }
+      }
+    };
+
+    const addTargets = (targets: OccupantsSliderTarget[]): void => {
+      for (const target of targets) {
+        const key = sliderTargetKey(target);
+        if (queuedTargets.has(key)) {
+          continue;
+        }
+        queuedTargets.add(key);
+        targetQueue.push(target);
+      }
+    };
+
+    let sliderListPayload: unknown | undefined;
+    let lastSliderListError: unknown;
+    for (const pathGroup of OCCUPANTS_SLIDER_LIST_PATH_GROUPS) {
+      try {
+        sliderListPayload = await this.requestServiceJsonWithPathFallback<unknown>(
+          pathGroup,
           {
             method: 'GET',
             auth: true,
           },
         );
-
-        discoveredDevices.push(...parseDevices(detailsPayload));
-        const detailShadows = parseDeviceShadows(detailsPayload, this.deviceIdToDsn, this.deviceKeyToDsn);
-        for (const [dsn, properties] of detailShadows) {
-          const existing = mergedShadows.get(dsn);
-          if (existing) {
-            mergePropertyMaps(existing, properties);
-          } else {
-            mergedShadows.set(dsn, properties);
-          }
+        discoveredDevices.push(...parseDevices(sliderListPayload));
+        mergeShadowsFromPayload(sliderListPayload);
+        addTargets(extractOccupantsSliderTargets(sliderListPayload));
+        if (discoveredDevices.length > 0 || targetQueue.length > 0) {
+          break;
         }
+      } catch (error) {
+        lastSliderListError = error;
+        if (error instanceof HttpStatusError && STATUS_ALLOW_OCCUPANTS_VARIANT_FALLBACK.has(error.status)) {
+          continue;
+        }
+        throw error;
       }
-    } else {
-      discoveredDevices.push(...parseDevices(gatewayListPayload));
-      const listShadows = parseDeviceShadows(gatewayListPayload, this.deviceIdToDsn, this.deviceKeyToDsn);
-      for (const [dsn, properties] of listShadows) {
-        mergedShadows.set(dsn, properties);
+    }
+
+    if (sliderListPayload === undefined) {
+      throw lastSliderListError ?? new OccupantsDiscoveryEmptyError('Occupants slider_list endpoint did not return data.');
+    }
+
+    if (this.verboseLogging) {
+      this.log.debug(
+        `Occupants slider_list produced ${discoveredDevices.length} candidate device(s) and ${targetQueue.length} slider target(s).`,
+      );
+    }
+
+    const visitedTargetIds = new Set<string>();
+    while (targetQueue.length > 0) {
+      const nextTarget = targetQueue.shift();
+      if (!nextTarget) {
+        continue;
+      }
+
+      const targetIdKey = nextTarget.id.trim();
+      if (visitedTargetIds.has(targetIdKey)) {
+        continue;
+      }
+      visitedTargetIds.add(targetIdKey);
+
+      const detailPayloads = await this.fetchOccupantsSliderDetailsPayloads(nextTarget);
+      for (const detailPayload of detailPayloads) {
+        discoveredDevices.push(...parseDevices(detailPayload));
+        mergeShadowsFromPayload(detailPayload);
+        addTargets(extractOccupantsSliderTargets(detailPayload));
       }
     }
 
@@ -414,6 +475,49 @@ export class SalusCloudClient {
     }
 
     return devices;
+  }
+
+  private async fetchOccupantsSliderDetailsPayloads(target: OccupantsSliderTarget): Promise<unknown[]> {
+    const payloads: unknown[] = [];
+    const pathGroups = buildSliderDetailsPathGroups(target.id, target.typeHints);
+    let lastError: unknown;
+
+    for (const pathGroup of pathGroups) {
+      try {
+        const payload = await this.requestServiceJsonWithPathFallback<unknown>(
+          pathGroup,
+          {
+            method: 'GET',
+            auth: true,
+          },
+        );
+        payloads.push(payload);
+
+        if (parseDevices(payload).length > 0) {
+          return payloads;
+        }
+      } catch (error) {
+        lastError = error;
+        if (error instanceof HttpStatusError && STATUS_ALLOW_OCCUPANTS_VARIANT_FALLBACK.has(error.status)) {
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    if (payloads.length > 0) {
+      return payloads;
+    }
+
+    if (lastError instanceof HttpStatusError && STATUS_ALLOW_OCCUPANTS_VARIANT_FALLBACK.has(lastError.status)) {
+      return [];
+    }
+
+    if (lastError) {
+      throw lastError;
+    }
+
+    return [];
   }
 
   private async listDevicesLegacy(): Promise<SalusDevice[]> {
@@ -2361,115 +2465,387 @@ function parseCognitoErrorMessage(responseBody: string): string {
   }
 }
 
-function parseGatewayIdsFromOccupantsPayload(payload: unknown): string[] {
-  const root = asRecord(payload);
-  if (!root) {
-    return [];
-  }
+function extractOccupantsSliderTargets(payload: unknown): OccupantsSliderTarget[] {
+  const queue: unknown[] = [payload];
+  const visited = new Set<unknown>();
+  const byId = new Map<string, Set<string>>();
 
-  const data = asArray(root.data) ?? asArray(root.results) ?? asArray(root.list);
-  if (!data) {
-    return [];
-  }
-
-  const ids: string[] = [];
-  for (const entry of data) {
-    const record = asRecord(entry);
-    const id = asString(record?.id)
-      ?? asString(record?.gateway_id)
-      ?? asString(record?.gatewayId);
-    if (!id) {
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || typeof current !== 'object') {
       continue;
     }
-    ids.push(id);
+    if (visited.has(current)) {
+      continue;
+    }
+    visited.add(current);
+
+    if (Array.isArray(current)) {
+      for (const entry of current) {
+        queue.push(entry);
+      }
+      continue;
+    }
+
+    const record = current as Record<string, unknown>;
+    for (const target of collectSliderTargetsFromRecord(record)) {
+      const existing = byId.get(target.id);
+      if (existing) {
+        for (const hint of target.typeHints) {
+          existing.add(hint);
+        }
+      } else {
+        byId.set(target.id, new Set(target.typeHints));
+      }
+    }
+
+    for (const value of Object.values(record)) {
+      if (value && typeof value === 'object') {
+        queue.push(value);
+      }
+    }
   }
 
-  return dedupeStringArray(ids);
+  return [...byId.entries()].map(([id, hints]) => ({
+    id,
+    typeHints: [...hints],
+  }));
+}
+
+function collectSliderTargetsFromRecord(record: Record<string, unknown>): OccupantsSliderTarget[] {
+  const targets: OccupantsSliderTarget[] = [];
+
+  const addTarget = (idRaw: unknown, typeHints: string[]): void => {
+    const id = normalizeNonEmptyString(asString(idRaw));
+    if (!id) {
+      return;
+    }
+    const normalizedTypeHints = dedupeStringArray(
+      typeHints
+        .map((value) => normalizeSliderType(value))
+        .filter((value): value is string => Boolean(value)),
+    );
+    targets.push({
+      id,
+      typeHints: normalizedTypeHints,
+    });
+  };
+
+  addTarget(record.gateway_id ?? record.gatewayId, ['gateway']);
+  addTarget(record.occupant_id ?? record.occupantId ?? record.user_id ?? record.userId, ['occupant']);
+  addTarget(record.home_id ?? record.homeId ?? record.house_id ?? record.houseId, ['home']);
+  addTarget(record.site_id ?? record.siteId ?? record.location_id ?? record.locationId, ['site']);
+  addTarget(record.group_id ?? record.groupId, ['group']);
+  addTarget(record.room_id ?? record.roomId ?? record.zone_id ?? record.zoneId, ['room']);
+
+  const id = normalizeNonEmptyString(
+    asString(record.id)
+    ?? asString(record.slider_id)
+    ?? asString(record.item_id),
+  );
+  if (id && (!recordHasDeviceIdentity(record) || recordHasSliderNavigation(record))) {
+    addTarget(id, inferSliderTypeHints(record));
+  }
+
+  return targets;
+}
+
+function inferSliderTypeHints(record: Record<string, unknown>): string[] {
+  const hints: string[] = [];
+
+  const typeCandidates = [
+    asString(record.type),
+    asString(record.slider_type),
+    asString(record.item_type),
+    asString(record.object_type),
+    asString(record.kind),
+    asString(record.category),
+    asString(record.target_type),
+  ];
+  for (const candidate of typeCandidates) {
+    if (!candidate) {
+      continue;
+    }
+    const normalized = normalizeSliderType(candidate);
+    if (normalized) {
+      hints.push(normalized);
+    }
+  }
+
+  if ('gateway_id' in record || 'gatewayId' in record || 'gateways' in record || parseBooleanLike(record.is_gateway) === true) {
+    hints.push('gateway');
+  }
+  if ('occupant_id' in record || 'occupantId' in record) {
+    hints.push('occupant');
+  }
+  if ('home_id' in record || 'homeId' in record || 'house_id' in record || 'houseId' in record || 'homes' in record || 'houses' in record) {
+    hints.push('home');
+  }
+  if ('site_id' in record || 'siteId' in record || 'sites' in record || 'location_id' in record || 'locationId' in record) {
+    hints.push('site');
+  }
+  if ('group_id' in record || 'groupId' in record || 'groups' in record) {
+    hints.push('group');
+  }
+  if ('room_id' in record || 'roomId' in record || 'zone_id' in record || 'zoneId' in record || 'rooms' in record || 'zones' in record) {
+    hints.push('room');
+  }
+
+  return dedupeStringArray(hints);
+}
+
+function normalizeSliderType(value: string): string | undefined {
+  const compact = value.trim().toLowerCase().replace(/[^a-z]/g, '');
+  if (!compact) {
+    return undefined;
+  }
+
+  if (compact.includes('gateway') || compact === 'gw') {
+    return 'gateway';
+  }
+  if (compact.includes('occupant') || compact.includes('user') || compact.includes('profile')) {
+    return 'occupant';
+  }
+  if (compact.includes('home') || compact.includes('house') || compact.includes('residence')) {
+    return 'home';
+  }
+  if (compact.includes('site') || compact.includes('location')) {
+    return 'site';
+  }
+  if (compact.includes('group')) {
+    return 'group';
+  }
+  if (compact.includes('room') || compact.includes('zone')) {
+    return 'room';
+  }
+
+  return undefined;
+}
+
+function recordHasSliderNavigation(record: Record<string, unknown>): boolean {
+  const navigationKeys = [
+    'children',
+    'child_list',
+    'list',
+    'items',
+    'gateways',
+    'homes',
+    'houses',
+    'sites',
+    'groups',
+    'rooms',
+    'zones',
+    'data',
+    'results',
+  ];
+
+  for (const key of navigationKeys) {
+    if (!(key in record)) {
+      continue;
+    }
+    const value = record[key];
+    if (Array.isArray(value)) {
+      return true;
+    }
+    if (asRecord(value)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function buildSliderDetailsPathGroups(targetId: string, typeHints: string[]): string[][] {
+  const encodedId = encodeURIComponent(targetId);
+  const normalizedHints = typeHints
+    .map((value) => normalizeSliderType(value))
+    .filter((value): value is string => Boolean(value));
+  const orderedTypes = dedupeStringArray([
+    ...normalizedHints,
+    ...OCCUPANTS_SLIDER_DETAIL_TYPE_FALLBACKS,
+  ]);
+
+  const groups: string[][] = [];
+  for (const type of orderedTypes) {
+    const encodedType = encodeURIComponent(type);
+    groups.push([
+      `/occupants/slider_details?id=${encodedId}&type=${encodedType}`,
+      `/api/v1/occupants/slider_details?id=${encodedId}&type=${encodedType}`,
+    ]);
+  }
+
+  groups.push([
+    `/occupants/slider_details?id=${encodedId}`,
+    `/api/v1/occupants/slider_details?id=${encodedId}`,
+  ]);
+
+  return groups;
+}
+
+function sliderTargetKey(target: OccupantsSliderTarget): string {
+  const normalizedHints = dedupeStringArray(
+    target.typeHints
+      .map((value) => normalizeSliderType(value))
+      .filter((value): value is string => Boolean(value))
+      .sort(),
+  );
+  return `${target.id}::${normalizedHints.join(',')}`;
 }
 
 function parseDevices(payload: unknown): SalusDevice[] {
-  const root = asRecord(payload);
-  const candidates: unknown[][] = [];
-
-  if (Array.isArray(payload)) {
-    candidates.push(payload);
-  }
-
-  if (root) {
-    const arrayKeys = ['devices', 'registered_nodes', 'nodes', 'results', 'data', 'list', 'device_list', 'value'];
-    for (const key of arrayKeys) {
-      const arr = asArray(root[key]);
-      if (arr) {
-        candidates.push(arr);
-      }
-    }
-
-    // Some payloads return an object map keyed by device identifiers.
-    const mappedDevices = asRecord(root.devices);
-    if (mappedDevices) {
-      const values = Object.values(mappedDevices);
-      if (values.length > 0) {
-        candidates.push(values);
-      }
-    }
-  }
-
   const result: SalusDevice[] = [];
-  const visitedEntries = new Set<unknown>();
+  const queue: unknown[] = [payload];
+  const visited = new Set<unknown>();
 
-  for (const candidate of candidates) {
-    for (const item of candidate) {
-      if (visitedEntries.has(item)) {
-        continue;
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || typeof current !== 'object') {
+      continue;
+    }
+    if (visited.has(current)) {
+      continue;
+    }
+    visited.add(current);
+
+    if (Array.isArray(current)) {
+      for (const entry of current) {
+        queue.push(entry);
       }
-      visitedEntries.add(item);
+      continue;
+    }
 
-      const rawItem = asRecord(item);
-      const deviceWrapper = rawItem?.device;
-      const normalized = asRecord(deviceWrapper) ?? rawItem;
-      if (!normalized) {
-        continue;
+    const record = current as Record<string, unknown>;
+    const candidateRecords = [
+      record,
+      asRecord(record.device),
+      asRecord(record.node),
+      asRecord(record.registered_node),
+      asRecord(record.value),
+    ].filter((value): value is Record<string, unknown> => Boolean(value));
+
+    for (const candidate of candidateRecords) {
+      const parsed = parseDeviceRecord(candidate);
+      if (parsed) {
+        result.push(parsed);
       }
+    }
 
-      const dsn = asString(normalized.dsn)
-        ?? asString(normalized.device_dsn)
-        ?? asString(normalized.device_code)
-        ?? asString(normalized.DSN);
-      if (!dsn) {
-        continue;
+    for (const value of Object.values(record)) {
+      if (value && typeof value === 'object') {
+        queue.push(value);
       }
-
-      const key = asString(normalized.key) ?? asString(normalized.device_key);
-      const id = asString(normalized.id)
-        ?? asString(normalized.device_id)
-        ?? key
-        ?? dsn;
-
-      const modelRaw = asString(normalized.oem_model)
-        ?? asString(normalized.model)
-        ?? asString(normalized.model_name)
-        ?? asString(normalized.product_class)
-        ?? asString(normalized.device_model)
-        ?? '';
-
-      const model = normalizeModelName(modelRaw);
-      const displayName = deriveDeviceDisplayName(normalized, dsn, model);
-      const online = deriveOnlineState(normalized);
-
-      result.push({
-        id,
-        dsn,
-        key,
-        model,
-        name: displayName,
-        productName: asString(normalized.product_name),
-        online,
-        raw: normalized,
-      });
     }
   }
 
   return dedupeDevicesByDsn(result);
+}
+
+function parseDeviceRecord(record: Record<string, unknown>): SalusDevice | undefined {
+  const explicitDsn = normalizeNonEmptyString(
+    asString(record.dsn)
+    ?? asString(record.device_dsn)
+    ?? asString(record.device_code)
+    ?? asString(record.DSN)
+    ?? asString(record.unique_hardware_id)
+    ?? asString(record.uniqueHardwareId)
+    ?? asString(record.serial_number)
+    ?? asString(record.serialNumber)
+    ?? asString(record.mac_address)
+    ?? asString(record.mac)
+    ?? asString(record.ieee_address),
+  );
+
+  const key = normalizeNonEmptyString(
+    asString(record.key)
+    ?? asString(record.device_key)
+    ?? asString(record.unique_hardware_id)
+    ?? asString(record.uniqueHardwareId),
+  );
+  const id = normalizeNonEmptyString(
+    asString(record.id)
+    ?? asString(record.device_id)
+    ?? asString(record.node_id)
+    ?? key
+    ?? explicitDsn,
+  );
+  const dsn = explicitDsn ?? key ?? id;
+
+  if (!dsn || !id) {
+    return undefined;
+  }
+  if (!explicitDsn && !looksLikeDeviceRecord(record)) {
+    return undefined;
+  }
+
+  const modelRaw = asString(record.oem_model)
+    ?? asString(record.model)
+    ?? asString(record.model_name)
+    ?? asString(record.product_class)
+    ?? asString(record.device_model)
+    ?? asString(record.product_name)
+    ?? '';
+
+  const model = normalizeModelName(modelRaw);
+  const displayName = deriveDeviceDisplayName(record, dsn, model);
+  const online = deriveOnlineState(record);
+
+  return {
+    id,
+    dsn,
+    key: key ?? undefined,
+    model,
+    name: displayName,
+    productName: asString(record.product_name),
+    online,
+    raw: record,
+  };
+}
+
+function looksLikeDeviceRecord(record: Record<string, unknown>): boolean {
+  if (recordHasDeviceIdentity(record)) {
+    return true;
+  }
+
+  const modelHints = [
+    record.oem_model,
+    record.model,
+    record.model_name,
+    record.product_class,
+    record.device_model,
+  ];
+  if (modelHints.some((value) => normalizeNonEmptyString(asString(value)))) {
+    return true;
+  }
+
+  const stateHints = ['shadow', 'device_shadow', 'properties', 'property_values', 'datapoints', 'reported', 'desired', 'state'];
+  for (const key of stateHints) {
+    if (key in record) {
+      return true;
+    }
+  }
+
+  if ('device_name' in record || 'product_name' in record) {
+    return true;
+  }
+
+  return false;
+}
+
+function recordHasDeviceIdentity(record: Record<string, unknown>): boolean {
+  const idHints = [
+    record.dsn,
+    record.device_dsn,
+    record.device_code,
+    record.DSN,
+    record.unique_hardware_id,
+    record.uniqueHardwareId,
+    record.key,
+    record.device_key,
+    record.device_id,
+    record.node_id,
+  ];
+
+  return idHints.some((value) => normalizeNonEmptyString(asString(value)));
 }
 
 function parseDeviceShadows(
