@@ -66,6 +66,12 @@ class HttpStatusError extends Error {
   }
 }
 
+class LegacyFallbackRequiredError extends Error {
+  constructor(message: string) {
+    super(message);
+  }
+}
+
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_BASE_DELAY_MS = 750;
 const MAX_RETRY_DELAY_MS = 60_000;
@@ -1313,6 +1319,12 @@ export class SalusCloudClient {
               lastRetriableError = lastError;
               baseIndex -= 1;
               continue;
+            }
+
+            if (responseCode === '900008') {
+              throw new LegacyFallbackRequiredError(
+                `Modern Salus API returned response_code=900008 on ${options.method} ${path} at ${baseUrl}.`,
+              );
             }
 
             const rotatedTo = rotateAuthorizationHeaderProfile(this.authorizationHeaderProfile);
@@ -2671,6 +2683,10 @@ function isRetriableFailure(error: unknown): boolean {
 }
 
 function shouldSwitchToLegacyApi(error: unknown): boolean {
+  if (error instanceof LegacyFallbackRequiredError) {
+    return true;
+  }
+
   if (!(error instanceof HttpStatusError)) {
     return false;
   }
