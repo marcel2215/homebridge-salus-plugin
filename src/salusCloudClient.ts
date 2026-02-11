@@ -222,9 +222,11 @@ export class SalusCloudClient {
   private readonly deviceKeyToDsn: Map<string, string> = new Map();
   private readonly blockedSliderDetailsTargetIds: Set<string> = new Set();
   private readonly blockedPropertyShadowDsns: Set<string> = new Set();
-  private disableSliderDetailsDiscovery = false;
+  private skipModernDeviceShadows = false;
   private hasWarnedAboutSliderDetailsAuthFailure = false;
+  private hasWarnedAboutDeviceShadowAuthFailure = false;
   private hasWarnedAboutLegacyProbeFailure = false;
+  private hasWarnedAboutPartialDiscoveryFallback = false;
   private hasEstablishedModernAuthContext = false;
   private lastKnownDevices: SalusDevice[] = [];
   private preferredShadowVariantDescription: string | null = null;
@@ -301,8 +303,9 @@ export class SalusCloudClient {
 
     try {
       const devices = await this.listDevicesModern();
-      this.rememberLastKnownDevices(devices);
-      return devices;
+      const stabilized = this.applyPartialDiscoveryProtection(devices);
+      this.rememberLastKnownDevices(stabilized);
+      return stabilized;
     } catch (error) {
       if (!shouldSwitchToLegacyApi(error)) {
         const cachedFallback = this.getLastKnownDevicesSnapshot();
@@ -396,14 +399,35 @@ export class SalusCloudClient {
       }
     }
 
-    const shadowPayload = await this.fetchDeviceShadows(devices);
-    if (shadowPayload.size > 0) {
-      this.mergeIntoPropertyCache(shadowPayload);
-      if (this.verboseLogging) {
-        this.log.debug(`Hydrated property cache from devices/device_shadows for ${shadowPayload.size} device(s)`);
+    if (!this.skipModernDeviceShadows) {
+      try {
+        const shadowPayload = await this.fetchDeviceShadows(devices);
+        if (shadowPayload.size > 0) {
+          this.mergeIntoPropertyCache(shadowPayload);
+          if (this.verboseLogging) {
+            this.log.debug(`Hydrated property cache from devices/device_shadows for ${shadowPayload.size} device(s)`);
+          }
+        } else if (devices.length > 0 && inlineShadows.size === 0 && inlinePropertiesFromRecords === 0) {
+          this.log.warn('No property payload was returned by devices/device_shadows. Accessory states may stay stale until Salus API responds.');
+        }
+      } catch (error) {
+        if (this.shouldDisableModernDeviceShadowQueries(error)) {
+          this.skipModernDeviceShadows = true;
+          if (!this.hasWarnedAboutDeviceShadowAuthFailure) {
+            this.hasWarnedAboutDeviceShadowAuthFailure = true;
+            this.log.warn(
+              `Salus cloud denied devices/device_shadows (${asErrorMessage(error)}).`
+              + ' Continuing sync with inline occupants/devices payload properties only.',
+            );
+          } else if (this.verboseLogging) {
+            this.log.debug(`Skipping devices/device_shadows after prior authorization failure: ${asErrorMessage(error)}`);
+          }
+        } else if (shouldTryAlternateDiscovery(error) || error instanceof LegacyFallbackRequiredError) {
+          this.log.warn(`Device shadow query failed after /devices discovery (${asErrorMessage(error)}). Continuing with available data.`);
+        } else {
+          throw error;
+        }
       }
-    } else if (devices.length > 0 && inlineShadows.size === 0 && inlinePropertiesFromRecords === 0) {
-      this.log.warn('No property payload was returned by devices/device_shadows. Accessory states may stay stale until Salus API responds.');
     }
 
     if (this.verboseLogging) {
@@ -539,21 +563,34 @@ export class SalusCloudClient {
       }
     }
 
-    try {
-      const shadowPayload = await this.fetchDeviceShadows(devices);
-      if (shadowPayload.size > 0) {
-        this.mergeIntoPropertyCache(shadowPayload);
-        if (this.verboseLogging) {
-          this.log.debug(`Hydrated property cache from devices/device_shadows for ${shadowPayload.size} device(s)`);
+    if (!this.skipModernDeviceShadows) {
+      try {
+        const shadowPayload = await this.fetchDeviceShadows(devices);
+        if (shadowPayload.size > 0) {
+          this.mergeIntoPropertyCache(shadowPayload);
+          if (this.verboseLogging) {
+            this.log.debug(`Hydrated property cache from devices/device_shadows for ${shadowPayload.size} device(s)`);
+          }
+        } else if (devices.length > 0 && mergedShadows.size === 0 && inlinePropertiesFromRecords === 0) {
+          this.log.warn('No property payload was returned by devices/device_shadows. Accessory states may stay stale until Salus API responds.');
         }
-      } else if (devices.length > 0 && mergedShadows.size === 0 && inlinePropertiesFromRecords === 0) {
-        this.log.warn('No property payload was returned by devices/device_shadows. Accessory states may stay stale until Salus API responds.');
-      }
-    } catch (error) {
-      if (shouldTryAlternateDiscovery(error) || error instanceof LegacyFallbackRequiredError) {
-        this.log.warn(`Device shadow query failed after occupants discovery (${asErrorMessage(error)}). Continuing with available data.`);
-      } else {
-        throw error;
+      } catch (error) {
+        if (this.shouldDisableModernDeviceShadowQueries(error)) {
+          this.skipModernDeviceShadows = true;
+          if (!this.hasWarnedAboutDeviceShadowAuthFailure) {
+            this.hasWarnedAboutDeviceShadowAuthFailure = true;
+            this.log.warn(
+              `Salus cloud denied devices/device_shadows (${asErrorMessage(error)}).`
+              + ' Continuing sync with inline occupants/devices payload properties only.',
+            );
+          } else if (this.verboseLogging) {
+            this.log.debug(`Skipping devices/device_shadows after prior authorization failure: ${asErrorMessage(error)}`);
+          }
+        } else if (shouldTryAlternateDiscovery(error) || error instanceof LegacyFallbackRequiredError) {
+          this.log.warn(`Device shadow query failed after occupants discovery (${asErrorMessage(error)}). Continuing with available data.`);
+        } else {
+          throw error;
+        }
       }
     }
 
@@ -565,10 +602,6 @@ export class SalusCloudClient {
   }
 
   private async fetchOccupantsSliderDetailsPayloads(target: OccupantsSliderTarget): Promise<unknown[]> {
-    if (this.disableSliderDetailsDiscovery) {
-      return [];
-    }
-
     const normalizedTargetId = target.id.trim();
     if (!normalizedTargetId || this.blockedSliderDetailsTargetIds.has(normalizedTargetId)) {
       return [];
@@ -595,13 +628,12 @@ export class SalusCloudClient {
       } catch (error) {
         lastError = error;
         if (error instanceof LegacyFallbackRequiredError) {
-          this.disableSliderDetailsDiscovery = true;
           this.blockedSliderDetailsTargetIds.add(normalizedTargetId);
           if (!this.hasWarnedAboutSliderDetailsAuthFailure) {
             this.hasWarnedAboutSliderDetailsAuthFailure = true;
             this.log.warn(
               `Salus cloud denied /occupants/slider_details for id=${normalizedTargetId}.`
-              + ' Continuing with slider_list discovery only and disabling slider_details probing.',
+              + ' Continuing with slider_list discovery only and skipping restricted slider_details targets.',
             );
           } else if (this.verboseLogging) {
             this.log.debug(`Skipping restricted /occupants/slider_details target id=${normalizedTargetId}.`);
@@ -609,7 +641,6 @@ export class SalusCloudClient {
           return payloads;
         }
         if (error instanceof HttpStatusError && (error.status === 401 || error.status === 403)) {
-          this.disableSliderDetailsDiscovery = true;
           this.blockedSliderDetailsTargetIds.add(normalizedTargetId);
           if (this.verboseLogging) {
             this.log.debug(`Skipping unauthorized /occupants/slider_details target id=${normalizedTargetId}.`);
@@ -705,6 +736,10 @@ export class SalusCloudClient {
   }
 
   private async listPropertiesModern(dsn: string): Promise<SalusPropertyMap> {
+    if (this.skipModernDeviceShadows) {
+      return this.propertyCacheByDsn.get(dsn) ?? new Map();
+    }
+
     if (this.blockedPropertyShadowDsns.has(dsn)) {
       return this.propertyCacheByDsn.get(dsn) ?? new Map();
     }
@@ -924,6 +959,8 @@ export class SalusCloudClient {
     this.authRequestInFlight = null;
     this.hasWarnedAboutAuthCompanyCode = false;
     this.hasEstablishedModernAuthContext = false;
+    this.skipModernDeviceShadows = false;
+    this.hasWarnedAboutDeviceShadowAuthFailure = false;
 
     if (!this.hasWarnedAboutLegacyFallback) {
       this.hasWarnedAboutLegacyFallback = true;
@@ -981,6 +1018,44 @@ export class SalusCloudClient {
 
   private getLastKnownDevicesSnapshot(): SalusDevice[] {
     return this.lastKnownDevices.map((device) => ({ ...device }));
+  }
+
+  private shouldDisableModernDeviceShadowQueries(error: unknown): boolean {
+    if (error instanceof LegacyFallbackRequiredError) {
+      return true;
+    }
+    if (error instanceof HttpStatusError && (error.status === 401 || error.status === 403)) {
+      return true;
+    }
+    return false;
+  }
+
+  private applyPartialDiscoveryProtection(devices: SalusDevice[]): SalusDevice[] {
+    const previous = this.lastKnownDevices;
+    if (previous.length === 0 || devices.length >= previous.length) {
+      this.hasWarnedAboutPartialDiscoveryFallback = false;
+      return devices;
+    }
+
+    const severeDropThreshold = Math.max(1, Math.floor(previous.length * 0.8));
+    const severeDropDetected = devices.length <= severeDropThreshold;
+    const authRestrictedDiscovery = this.hasWarnedAboutSliderDetailsAuthFailure || this.skipModernDeviceShadows;
+    if (!severeDropDetected || !authRestrictedDiscovery) {
+      this.hasWarnedAboutPartialDiscoveryFallback = false;
+      return devices;
+    }
+
+    const merged = mergeDevicesPreferCurrent(devices, previous);
+    if (!this.hasWarnedAboutPartialDiscoveryFallback) {
+      this.hasWarnedAboutPartialDiscoveryFallback = true;
+      this.log.warn(
+        `Salus discovery returned ${devices.length} device(s) while previous sync had ${previous.length}.`
+        + ' Keeping prior device list to avoid stale accessory churn until discovery stabilizes.',
+      );
+    } else if (this.verboseLogging) {
+      this.log.debug(`Keeping previous device list (${previous.length}) during partial discovery result (${devices.length}).`);
+    }
+    return merged;
   }
 
   private async fetchDeviceShadows(devices: SalusDevice[], preferredDsns?: string[]): Promise<Map<string, SalusPropertyMap>> {
@@ -3422,6 +3497,17 @@ function deriveOnlineState(record: Record<string, unknown>): boolean | undefined
 function dedupeDevicesByDsn(devices: SalusDevice[]): SalusDevice[] {
   const byDsn = new Map<string, SalusDevice>();
   for (const device of devices) {
+    byDsn.set(device.dsn, device);
+  }
+  return [...byDsn.values()];
+}
+
+function mergeDevicesPreferCurrent(current: SalusDevice[], previous: SalusDevice[]): SalusDevice[] {
+  const byDsn = new Map<string, SalusDevice>();
+  for (const device of previous) {
+    byDsn.set(device.dsn, device);
+  }
+  for (const device of current) {
     byDsn.set(device.dsn, device);
   }
   return [...byDsn.values()];
