@@ -222,7 +222,11 @@ export class SalusCloudClient {
   private readonly deviceKeyToDsn: Map<string, string> = new Map();
   private readonly blockedSliderDetailsTargetIds: Set<string> = new Set();
   private readonly blockedPropertyShadowDsns: Set<string> = new Set();
+  private disableSliderDetailsDiscovery = false;
   private hasWarnedAboutSliderDetailsAuthFailure = false;
+  private hasWarnedAboutLegacyProbeFailure = false;
+  private hasEstablishedModernAuthContext = false;
+  private lastKnownDevices: SalusDevice[] = [];
   private preferredShadowVariantDescription: string | null = null;
   private readonly preferredWriteAttemptByKey: Map<string, string> = new Map();
   private insecureTlsInFlight = 0;
@@ -279,18 +283,66 @@ export class SalusCloudClient {
 
   public async listDevices(): Promise<SalusDevice[]> {
     if (this.apiTransportMode === 'legacy') {
-      return await this.listDevicesLegacy();
+      try {
+        const devices = await this.listDevicesLegacy();
+        this.rememberLastKnownDevices(devices);
+        return devices;
+      } catch (error) {
+        const cachedFallback = this.getLastKnownDevicesSnapshot();
+        if (cachedFallback.length > 0) {
+          this.log.warn(
+            `Legacy discovery failed (${asErrorMessage(error)}). Continuing with ${cachedFallback.length} cached device(s).`,
+          );
+          return cachedFallback;
+        }
+        throw error;
+      }
     }
 
     try {
-      return await this.listDevicesModern();
+      const devices = await this.listDevicesModern();
+      this.rememberLastKnownDevices(devices);
+      return devices;
     } catch (error) {
       if (!shouldSwitchToLegacyApi(error)) {
+        const cachedFallback = this.getLastKnownDevicesSnapshot();
+        if (cachedFallback.length > 0 && (error instanceof HttpStatusError || isRetriableFailure(error))) {
+          this.log.warn(
+            `Modern discovery failed (${asErrorMessage(error)}). Continuing with ${cachedFallback.length} cached device(s).`,
+          );
+          return cachedFallback;
+        }
         throw error;
       }
 
-      this.switchToLegacyTransport(`Modern Salus API authorization failed: ${asErrorMessage(error)}`);
-      return await this.listDevicesLegacy();
+      try {
+        const devices = await this.listDevicesLegacy();
+        this.switchToLegacyTransport(`Modern Salus API authorization failed: ${asErrorMessage(error)}`);
+        this.hasWarnedAboutLegacyProbeFailure = false;
+        this.rememberLastKnownDevices(devices);
+        return devices;
+      } catch (legacyError) {
+        if (!this.hasWarnedAboutLegacyProbeFailure) {
+          this.hasWarnedAboutLegacyProbeFailure = true;
+          this.log.warn(
+            `Modern discovery hit an authorization restriction (${asErrorMessage(error)}),`
+            + ` but legacy compatibility probe failed (${asErrorMessage(legacyError)}). Staying on modern transport.`,
+          );
+        } else if (this.verboseLogging) {
+          this.log.debug(`Legacy compatibility probe failed again: ${asErrorMessage(legacyError)}`);
+        }
+
+        const cachedFallback = this.getLastKnownDevicesSnapshot();
+        if (cachedFallback.length > 0) {
+          this.log.warn(`Continuing with ${cachedFallback.length} cached device(s) until discovery recovers.`);
+          return cachedFallback;
+        }
+
+        throw new Error(
+          `Modern discovery hit an authorization restriction (${asErrorMessage(error)}),`
+          + ` and legacy compatibility probe failed (${asErrorMessage(legacyError)}).`,
+        );
+      }
     }
   }
 
@@ -513,6 +565,10 @@ export class SalusCloudClient {
   }
 
   private async fetchOccupantsSliderDetailsPayloads(target: OccupantsSliderTarget): Promise<unknown[]> {
+    if (this.disableSliderDetailsDiscovery) {
+      return [];
+    }
+
     const normalizedTargetId = target.id.trim();
     if (!normalizedTargetId || this.blockedSliderDetailsTargetIds.has(normalizedTargetId)) {
       return [];
@@ -539,12 +595,13 @@ export class SalusCloudClient {
       } catch (error) {
         lastError = error;
         if (error instanceof LegacyFallbackRequiredError) {
+          this.disableSliderDetailsDiscovery = true;
           this.blockedSliderDetailsTargetIds.add(normalizedTargetId);
           if (!this.hasWarnedAboutSliderDetailsAuthFailure) {
             this.hasWarnedAboutSliderDetailsAuthFailure = true;
             this.log.warn(
               `Salus cloud denied /occupants/slider_details for id=${normalizedTargetId}.`
-              + ' Continuing with slider_list discovery only and skipping restricted slider_details targets.',
+              + ' Continuing with slider_list discovery only and disabling slider_details probing.',
             );
           } else if (this.verboseLogging) {
             this.log.debug(`Skipping restricted /occupants/slider_details target id=${normalizedTargetId}.`);
@@ -552,6 +609,7 @@ export class SalusCloudClient {
           return payloads;
         }
         if (error instanceof HttpStatusError && (error.status === 401 || error.status === 403)) {
+          this.disableSliderDetailsDiscovery = true;
           this.blockedSliderDetailsTargetIds.add(normalizedTargetId);
           if (this.verboseLogging) {
             this.log.debug(`Skipping unauthorized /occupants/slider_details target id=${normalizedTargetId}.`);
@@ -706,8 +764,13 @@ export class SalusCloudClient {
         throw error;
       }
 
-      this.switchToLegacyTransport(`Modern Salus datapoint write failed for ${dsn}/${propertyName}: ${asErrorMessage(error)}`);
-      await this.setDatapointLegacy(dsn, propertyName, value);
+      const reason = `Modern Salus datapoint write failed for ${dsn}/${propertyName}: ${asErrorMessage(error)}`;
+      try {
+        await this.setDatapointLegacy(dsn, propertyName, value);
+        this.switchToLegacyTransport(reason);
+      } catch (legacyError) {
+        throw new Error(`${reason}. Legacy compatibility write probe failed: ${asErrorMessage(legacyError)}`);
+      }
     }
   }
 
@@ -860,6 +923,7 @@ export class SalusCloudClient {
     this.session = null;
     this.authRequestInFlight = null;
     this.hasWarnedAboutAuthCompanyCode = false;
+    this.hasEstablishedModernAuthContext = false;
 
     if (!this.hasWarnedAboutLegacyFallback) {
       this.hasWarnedAboutLegacyFallback = true;
@@ -909,6 +973,14 @@ export class SalusCloudClient {
       }
       mergePropertyMaps(existing, properties);
     }
+  }
+
+  private rememberLastKnownDevices(devices: SalusDevice[]): void {
+    this.lastKnownDevices = devices.map((device) => ({ ...device }));
+  }
+
+  private getLastKnownDevicesSnapshot(): SalusDevice[] {
+    return this.lastKnownDevices.map((device) => ({ ...device }));
   }
 
   private async fetchDeviceShadows(devices: SalusDevice[], preferredDsns?: string[]): Promise<Map<string, SalusPropertyMap>> {
@@ -1673,6 +1745,7 @@ export class SalusCloudClient {
             const responseCode = extractServiceResponseCode(responseText);
             const hintedCompanyCode = extractCompanyCodeFromServiceAuthError(responseText);
             const isCompanyCodeMismatch = responseCode === '900008';
+            const allowCompanyCodeRotation = !this.hasEstablishedModernAuthContext;
 
             if (isCompanyCodeMismatch && !this.hasWarnedAboutAuthCompanyCode) {
               this.hasWarnedAboutAuthCompanyCode = true;
@@ -1696,29 +1769,7 @@ export class SalusCloudClient {
               continue;
             }
 
-            if (isCompanyCodeMismatch) {
-              const previousCompanyCode = this.activeCompanyCode;
-              const rotatedCompanyCode = this.rotateCompanyCodeCandidate(attemptedCompanyCodes, hintedCompanyCode);
-              if (companyCodeCandidateKey(rotatedCompanyCode) !== companyCodeCandidateKey(previousCompanyCode)) {
-                unauthorizedRecoverySteps += 1;
-                if (unauthorizedRecoverySteps > MAX_UNAUTHORIZED_RECOVERY_STEPS) {
-                  throw new Error(`Exceeded maximum unauthorized recovery steps while requesting ${options.method} ${path}`);
-                }
-                this.log.warn(
-                  rotatedCompanyCode
-                    ? `Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}.`
-                      + ` Retrying with alternate company code header: ${rotatedCompanyCode}.`
-                    : `Salus cloud returned 401 for ${options.method} ${path} at ${baseUrl}. Retrying without company code header.`,
-                );
-                lastError = new HttpStatusError('Unauthorized', 401, responseText);
-                sawRetriableFailure = true;
-                lastRetriableError = lastError;
-                baseIndex -= 1;
-                continue;
-              }
-            }
-
-            if (!isCompanyCodeMismatch) {
+            if (isCompanyCodeMismatch && allowCompanyCodeRotation) {
               const previousCompanyCode = this.activeCompanyCode;
               const rotatedCompanyCode = this.rotateCompanyCodeCandidate(attemptedCompanyCodes, hintedCompanyCode);
               if (companyCodeCandidateKey(rotatedCompanyCode) !== companyCodeCandidateKey(previousCompanyCode)) {
@@ -1789,6 +1840,9 @@ export class SalusCloudClient {
           }
 
           this.activeServiceApiBaseUrl = baseUrl;
+          if (authRequired) {
+            this.hasEstablishedModernAuthContext = true;
+          }
 
           if (response.status === 204) {
             return undefined as T;
