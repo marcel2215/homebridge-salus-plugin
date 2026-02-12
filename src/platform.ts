@@ -3,7 +3,7 @@
 import type { API, Characteristic, DynamicPlatformPlugin, Logging, PlatformAccessory, PlatformConfig, Service } from 'homebridge';
 
 import { getCatalogEntry, inferKindFromCatalog } from './deviceCatalog.js';
-import { hasAnyPropertyBase } from './propertyUtils.js';
+import { getBooleanProperty, hasAnyPropertyBase } from './propertyUtils.js';
 import { SalusCloudClient } from './salusCloudClient.js';
 import { SalusPlatformAccessory } from './platformAccessory.js';
 import { PLATFORM_NAME, PLUGIN_NAME } from './settings.js';
@@ -219,6 +219,13 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
     }
   }
 
+  public async readDeviceProperties(device: SalusDevice): Promise<SalusPropertyMap> {
+    if (!this.cloudClient) {
+      throw new Error('Salus cloud client is not initialized due to missing credentials.');
+    }
+    return await this.cloudClient.listProperties(device.dsn);
+  }
+
   public getUnmappedConstraintList(): string[] {
     return [...UNSUPPORTED_CONSTRAINTS];
   }
@@ -268,17 +275,19 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
         async (device) => {
           try {
             const properties = await this.cloudClient!.listProperties(device.dsn);
-            const profile = this.deriveProfile(device, properties);
-            return { device, properties, profile };
+            const normalizedDevice = normalizeDeviceOnlineState(device, properties);
+            const profile = this.deriveProfile(normalizedDevice, properties);
+            return { device: normalizedDevice, properties, profile };
           } catch (error) {
             const cachedFallback = this.cloudClient!.getCachedProperties(device.dsn);
             const fallbackProperties = cachedFallback ?? new Map();
-            const profile = this.deriveProfile(device, fallbackProperties);
+            const normalizedDevice = normalizeDeviceOnlineState(device, fallbackProperties);
+            const profile = this.deriveProfile(normalizedDevice, fallbackProperties);
             this.log.info(
               `Property sync degraded for ${device.name} (${device.dsn}): ${asErrorMessage(error)}.`
               + ` Continuing with ${cachedFallback ? 'cached' : 'empty'} properties.`,
             );
-            return { device, properties: fallbackProperties, profile };
+            return { device: normalizedDevice, properties: fallbackProperties, profile };
           }
         },
       );
@@ -646,6 +655,45 @@ function sanitizeHomeKitName(name: string, fallback: string): string {
     return fallbackNormalized;
   }
   return 'Salus Device';
+}
+
+function normalizeDeviceOnlineState(device: SalusDevice, properties: SalusPropertyMap): SalusDevice {
+  if (device.online !== undefined) {
+    return device;
+  }
+
+  const inferredOnline = inferOnlineStateFromProperties(properties);
+  if (inferredOnline === undefined) {
+    return device;
+  }
+
+  return {
+    ...device,
+    online: inferredOnline,
+  };
+}
+
+function inferOnlineStateFromProperties(properties: SalusPropertyMap): boolean | undefined {
+  const directOnline = getBooleanProperty(properties, [
+    'connected',
+    'OnlineState',
+    'OnlineStatus_i',
+    'WiFiConnected_d',
+    'LANConnected_d',
+    'CloudStatus',
+  ]);
+  if (directOnline !== undefined) {
+    return directOnline;
+  }
+
+  const lostConnection = getBooleanProperty(properties, [
+    'LostConnectionState',
+  ]);
+  if (lostConnection !== undefined) {
+    return !lostConnection;
+  }
+
+  return undefined;
 }
 
 function isDuplicateBridgeRegistrationError(error: unknown): boolean {

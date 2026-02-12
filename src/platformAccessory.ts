@@ -84,8 +84,8 @@ const THERMOSTAT_HUMIDITY = ['RelativeHumidity_x100', 'RelativeHumidity', 'Humid
 
 const WRITE_SYSTEM_MODE = ['SetSystemMode', 'SystemMode'];
 const WRITE_HEAT_SETPOINT = [
-  'SetHeatingSetpoint_x100',
   'HeatingSetpoint_x100',
+  'SetHeatingSetpoint_x100',
   'SetTargetTemperature_x100',
   'TargetTemperature_x100',
   'Setpoint_x100',
@@ -98,8 +98,8 @@ const WRITE_HEAT_SETPOINT = [
   'CloudySetpoint',
 ];
 const WRITE_COOL_SETPOINT = [
-  'SetCoolingSetpoint_x100',
   'CoolingSetpoint_x100',
+  'SetCoolingSetpoint_x100',
   'SetTargetTemperature_x100',
   'TargetTemperature_x100',
   'Setpoint_x100',
@@ -112,9 +112,9 @@ const WRITE_COOL_SETPOINT = [
   'SunnySetpoint',
 ];
 const WRITE_AUTO_HEAT_SETPOINT = [
+  'HeatingSetpoint_x100',
   'SetAutoHeatingSetpoint_x100',
   'SetHeatingSetpoint_x100',
-  'HeatingSetpoint_x100',
   'SetTargetTemperature_x100',
   'TargetTemperature_x100',
   'Setpoint_x100',
@@ -128,9 +128,9 @@ const WRITE_AUTO_HEAT_SETPOINT = [
   'CloudySetpoint',
 ];
 const WRITE_AUTO_COOL_SETPOINT = [
+  'CoolingSetpoint_x100',
   'SetAutoCoolingSetpoint_x100',
   'SetCoolingSetpoint_x100',
-  'CoolingSetpoint_x100',
   'SetTargetTemperature_x100',
   'TargetTemperature_x100',
   'Setpoint_x100',
@@ -243,8 +243,38 @@ export class SalusPlatformAccessory {
     }
 
     this.service.updateCharacteristic(this.platform.Characteristic.Name, this.device.name);
+    this.applyDeviceReachabilityState();
     this.refreshWriteTargets();
     this.updateServiceCharacteristics();
+  }
+
+  private applyDeviceReachabilityState(): void {
+    if (typeof this.device.online !== 'boolean') {
+      return;
+    }
+
+    const expectedReachable = this.device.online;
+    const hapAccessory = (this.accessory as unknown as {
+      _associatedHAPAccessory?: { reachable?: boolean };
+    })._associatedHAPAccessory;
+    if (hapAccessory && typeof hapAccessory.reachable === 'boolean' && hapAccessory.reachable !== expectedReachable) {
+      hapAccessory.reachable = expectedReachable;
+      this.platform.log.info(
+        `${this.device.name} (${this.device.dsn}) marked as ${expectedReachable ? 'reachable' : 'unreachable'} based on Salus cloud online state.`,
+      );
+    }
+
+    if (this.service.testCharacteristic(this.platform.Characteristic.StatusActive)) {
+      const statusActive = expectedReachable ? 1 : 0;
+      this.service.updateCharacteristic(this.platform.Characteristic.StatusActive, statusActive);
+    }
+
+    if (this.service.testCharacteristic(this.platform.Characteristic.StatusFault)) {
+      const statusFault = expectedReachable
+        ? this.platform.Characteristic.StatusFault.NO_FAULT
+        : this.platform.Characteristic.StatusFault.GENERAL_FAULT;
+      this.service.updateCharacteristic(this.platform.Characteristic.StatusFault, statusFault);
+    }
   }
 
   public getCurrentKind(): HomeKitDeviceKind {
@@ -773,7 +803,54 @@ export class SalusPlatformAccessory {
     for (const write of writes) {
       await this.platform.writeDeviceProperty(this.device, write.property, write.value);
     }
+    await this.ensureThermostatTargetApplied(targetTemperature, targetState);
     this.platform.log.info(`Set thermostat target for ${this.device.name} to ${targetTemperature.toFixed(1)}°C`);
+  }
+
+  private async ensureThermostatTargetApplied(
+    expectedTemperatureC: number,
+    targetState: number,
+  ): Promise<void> {
+    const maxAttempts = 6;
+    const toleranceC = 0.4;
+    let lastObserved: number | undefined;
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const properties = await this.platform.readDeviceProperties(this.device);
+        const heatingSetpointRaw = getNumberProperty(properties, THERMOSTAT_HEAT_SETPOINT);
+        const coolingSetpointRaw = getNumberProperty(properties, THERMOSTAT_COOL_SETPOINT);
+        const observed = targetState === this.platform.Characteristic.TargetHeatingCoolingState.COOL
+          ? coolingSetpointRaw
+          : heatingSetpointRaw;
+        if (observed !== undefined) {
+          const observedC = clamp(normalizeTemperatureFromX100(observed), 4.5, 35);
+          lastObserved = observedC;
+          if (Math.abs(observedC - expectedTemperatureC) <= toleranceC) {
+            return;
+          }
+        }
+      } catch (error) {
+        lastError = error;
+      }
+
+      if (attempt < maxAttempts) {
+        await sleep(1_500);
+      }
+    }
+
+    if (lastError) {
+      this.platform.log.warn(
+        `Unable to confirm thermostat setpoint for ${this.device.name} after write: ${asErrorMessage(lastError)}`,
+      );
+    } else {
+      this.platform.log.warn(
+        `Thermostat setpoint for ${this.device.name} did not converge to ${expectedTemperatureC.toFixed(1)}°C`
+        + `${lastObserved !== undefined ? ` (latest observed ${lastObserved.toFixed(1)}°C)` : ''}`,
+      );
+    }
+    throw this.communicationFailure('Thermostat setpoint write was not applied by Salus cloud');
   }
 
   private async setTargetHeatingCoolingState(value: CharacteristicValue): Promise<void> {
@@ -1091,4 +1168,8 @@ function asErrorMessage(error: unknown): string {
     return error.message;
   }
   return String(error);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -848,13 +848,19 @@ export class SalusCloudClient {
   }
 
   public async listProperties(dsn: string): Promise<SalusPropertyMap> {
-    const cached = this.propertyCacheByDsn.get(dsn);
-    if (cached) {
-      return cached;
-    }
-
     if (this.apiTransportMode === 'legacy') {
-      return await this.listPropertiesLegacy(dsn);
+      try {
+        return await this.listPropertiesLegacy(dsn);
+      } catch (error) {
+        const cachedFallback = this.propertyCacheByDsn.get(dsn);
+        if (cachedFallback) {
+          if (this.verboseLogging) {
+            this.log.debug(`Legacy property sync failed for ${dsn}; returning cached values (${asErrorMessage(error)}).`);
+          }
+          return cachedFallback;
+        }
+        throw error;
+      }
     }
 
     try {
