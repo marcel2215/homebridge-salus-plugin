@@ -33,15 +33,39 @@ const THERMOSTAT_CURRENT_TEMP = [
   'Temperature',
   'MeasuredValue',
 ];
+const THERMOSTAT_HEAT_SETPOINT_EFFECTIVE = [
+  'HeatingSetpoint_x100',
+  'HeatingSetpoint_x100_a',
+  'HeatingSetpoint',
+  'HeatingSetpoint_a',
+  'TargetTemperature_x100',
+  'TargetTemperature',
+  'Setpoint_x100',
+  'Setpoint',
+];
 const THERMOSTAT_HEAT_SETPOINT_COMMAND = [
   'SetHeatingSetpoint_x100',
+  'SetHeatingSetpoint_x100_a',
   'SetHeatingSetpoint',
+  'SetHeatingSetpoint_a',
   'SetTargetTemperature_x100',
   'SetTargetTemperature',
 ];
+const THERMOSTAT_COOL_SETPOINT_EFFECTIVE = [
+  'CoolingSetpoint_x100',
+  'CoolingSetpoint_x100_a',
+  'CoolingSetpoint',
+  'CoolingSetpoint_a',
+  'TargetTemperature_x100',
+  'TargetTemperature',
+  'Setpoint_x100',
+  'Setpoint',
+];
 const THERMOSTAT_COOL_SETPOINT_COMMAND = [
   'SetCoolingSetpoint_x100',
+  'SetCoolingSetpoint_x100_a',
   'SetCoolingSetpoint',
+  'SetCoolingSetpoint_a',
   'SetTargetTemperature_x100',
   'SetTargetTemperature',
 ];
@@ -817,11 +841,8 @@ export class SalusPlatformAccessory {
       queuedProperties.add(property);
       writes.push({ property, value: sampleLooksX100 ? scaledX100 : scaledPlain });
     };
-    const enqueueMirrorWrite = (property: string | undefined) => {
-      if (!property) {
-        return;
-      }
-      enqueueWrite(property);
+    const enqueueFirstDiscovered = (baseNames: string[]) => {
+      enqueueWrite(findPropertyByBaseName(this.latestProperties, baseNames));
     };
 
     if (targetState === this.platform.Characteristic.TargetHeatingCoolingState.COOL) {
@@ -831,27 +852,15 @@ export class SalusPlatformAccessory {
         this.writeTargets.heatSetpoint,
       ]);
       enqueueWrite(primary);
-      enqueueMirrorWrite(findPropertyByBaseName(this.latestProperties, [
-        'CoolingSetpoint_x100',
-        'SetCoolingSetpoint_x100',
-        'CoolingSetpoint',
-        'SetCoolingSetpoint',
-      ]));
+      enqueueFirstDiscovered(THERMOSTAT_COOL_SETPOINT_COMMAND);
+      enqueueFirstDiscovered(THERMOSTAT_COOL_SETPOINT_EFFECTIVE);
     } else if (targetState === this.platform.Characteristic.TargetHeatingCoolingState.AUTO) {
       enqueueWrite(pickFirstProperty([this.writeTargets.autoHeatSetpoint, this.writeTargets.heatSetpoint]));
       enqueueWrite(pickFirstProperty([this.writeTargets.autoCoolSetpoint, this.writeTargets.coolSetpoint]));
-      enqueueMirrorWrite(findPropertyByBaseName(this.latestProperties, [
-        'HeatingSetpoint_x100',
-        'SetHeatingSetpoint_x100',
-        'HeatingSetpoint',
-        'SetHeatingSetpoint',
-      ]));
-      enqueueMirrorWrite(findPropertyByBaseName(this.latestProperties, [
-        'CoolingSetpoint_x100',
-        'SetCoolingSetpoint_x100',
-        'CoolingSetpoint',
-        'SetCoolingSetpoint',
-      ]));
+      enqueueFirstDiscovered(THERMOSTAT_HEAT_SETPOINT_COMMAND);
+      enqueueFirstDiscovered(THERMOSTAT_HEAT_SETPOINT_EFFECTIVE);
+      enqueueFirstDiscovered(THERMOSTAT_COOL_SETPOINT_COMMAND);
+      enqueueFirstDiscovered(THERMOSTAT_COOL_SETPOINT_EFFECTIVE);
     } else {
       const primary = pickFirstProperty([
         this.writeTargets.heatSetpoint,
@@ -860,12 +869,8 @@ export class SalusPlatformAccessory {
         this.writeTargets.autoCoolSetpoint,
       ]);
       enqueueWrite(primary);
-      enqueueMirrorWrite(findPropertyByBaseName(this.latestProperties, [
-        'HeatingSetpoint_x100',
-        'SetHeatingSetpoint_x100',
-        'HeatingSetpoint',
-        'SetHeatingSetpoint',
-      ]));
+      enqueueFirstDiscovered(THERMOSTAT_HEAT_SETPOINT_COMMAND);
+      enqueueFirstDiscovered(THERMOSTAT_HEAT_SETPOINT_EFFECTIVE);
     }
 
     if (writes.length === 0) {
@@ -883,30 +888,42 @@ export class SalusPlatformAccessory {
     expectedTemperatureC: number,
     targetState: number,
   ): Promise<void> {
-    const maxAttempts = 6;
+    const maxAttempts = 10;
     const toleranceC = 0.4;
     let lastObserved: number | undefined;
+    let lastPrimaryObserved: number | undefined;
+    let lastCommandObserved: number | undefined;
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         const properties = await this.platform.readDeviceProperties(this.device);
         const primaryObserved = targetState === this.platform.Characteristic.TargetHeatingCoolingState.COOL
-          ? getNumberProperty(properties, THERMOSTAT_COOL_SETPOINT)
-          : getNumberProperty(properties, THERMOSTAT_HEAT_SETPOINT);
+          ? getNumberProperty(properties, THERMOSTAT_COOL_SETPOINT_EFFECTIVE)
+          : getNumberProperty(properties, THERMOSTAT_HEAT_SETPOINT_EFFECTIVE);
         const commandObserved = targetState === this.platform.Characteristic.TargetHeatingCoolingState.COOL
           ? getNumberProperty(properties, THERMOSTAT_COOL_SETPOINT_COMMAND)
           : getNumberProperty(properties, THERMOSTAT_HEAT_SETPOINT_COMMAND);
 
-        const observedValues = [primaryObserved, commandObserved]
-          .filter((value): value is number => value !== undefined)
-          .map((value) => clamp(normalizeTemperatureFromX100(value), 4.5, 35));
+        const primaryC = primaryObserved === undefined ? undefined : clamp(normalizeTemperatureFromX100(primaryObserved), 4.5, 35);
+        const commandC = commandObserved === undefined ? undefined : clamp(normalizeTemperatureFromX100(commandObserved), 4.5, 35);
+        if (primaryC !== undefined) {
+          lastObserved = primaryC;
+          lastPrimaryObserved = primaryC;
+        }
+        if (commandC !== undefined) {
+          lastCommandObserved = commandC;
+          if (lastObserved === undefined) {
+            lastObserved = commandC;
+          }
+        }
 
-        if (observedValues.length > 0) {
-          lastObserved = observedValues[0];
-          if (observedValues.some((observed) => Math.abs(observed - expectedTemperatureC) <= toleranceC)) {
+        if (primaryC !== undefined) {
+          if (Math.abs(primaryC - expectedTemperatureC) <= toleranceC) {
             return;
           }
+        } else if (commandC !== undefined && Math.abs(commandC - expectedTemperatureC) <= toleranceC) {
+          return;
         }
       } catch (error) {
         lastError = error;
@@ -924,7 +941,9 @@ export class SalusPlatformAccessory {
     } else {
       this.platform.log.warn(
         `Thermostat setpoint for ${this.device.name} did not converge to ${expectedTemperatureC.toFixed(1)}°C`
-        + `${lastObserved !== undefined ? ` (latest observed ${lastObserved.toFixed(1)}°C)` : ''}`,
+        + `${lastObserved !== undefined ? ` (latest observed ${lastObserved.toFixed(1)}°C)` : ''}`
+        + `${lastPrimaryObserved !== undefined ? `, effective=${lastPrimaryObserved.toFixed(1)}°C` : ''}`
+        + `${lastCommandObserved !== undefined ? `, command=${lastCommandObserved.toFixed(1)}°C` : ''}`,
       );
     }
     throw this.communicationFailure('Thermostat setpoint write was not applied by Salus cloud');
