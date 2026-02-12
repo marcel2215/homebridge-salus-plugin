@@ -465,12 +465,12 @@ export class SalusPlatformAccessory {
   private updateThermostatCharacteristics(): void {
     const currentTempRaw = getNumberProperty(this.latestProperties, THERMOSTAT_CURRENT_TEMP);
     const heatingSetpointRaw = this.resolveEffectiveThermostatSetpoint(
-      THERMOSTAT_HEAT_SETPOINT_COMMAND,
       THERMOSTAT_HEAT_SETPOINT_EFFECTIVE,
+      THERMOSTAT_HEAT_SETPOINT_COMMAND,
     );
     const coolingSetpointRaw = this.resolveEffectiveThermostatSetpoint(
-      THERMOSTAT_COOL_SETPOINT_COMMAND,
       THERMOSTAT_COOL_SETPOINT_EFFECTIVE,
+      THERMOSTAT_COOL_SETPOINT_COMMAND,
     );
     const systemModeRaw = getNumberProperty(this.latestProperties, THERMOSTAT_SYSTEM_MODE);
     const runningStateRaw = getNumberProperty(this.latestProperties, THERMOSTAT_RUNNING_STATE);
@@ -527,10 +527,10 @@ export class SalusPlatformAccessory {
   }
 
   private resolveEffectiveThermostatSetpoint(
-    primaryCandidates: string[],
+    effectiveCandidates: string[],
     commandCandidates: string[],
   ): number | undefined {
-    const primaryRaw = getNumberProperty(this.latestProperties, primaryCandidates);
+    const primaryRaw = getNumberProperty(this.latestProperties, effectiveCandidates);
     const commandRaw = getNumberProperty(this.latestProperties, commandCandidates);
 
     if (primaryRaw !== undefined) {
@@ -752,6 +752,28 @@ export class SalusPlatformAccessory {
     return this.latestProperties.get(name)?.value;
   }
 
+  private firstDefined(...candidates: Array<string | undefined>): string | undefined {
+    for (const candidate of candidates) {
+      if (candidate && candidate.trim() !== '') {
+        return candidate;
+      }
+    }
+    return undefined;
+  }
+
+  private encodeThermostatTemperatureForProperty(propertyName: string, temperatureC: number): number {
+    const sample = this.getPropertyValue(propertyName);
+    const numericSample = parseNumberLike(sample);
+    const normalizedName = propertyName.trim().toLowerCase();
+    const looksLikeX100 = normalizedName.includes('_x100')
+      || normalizedName.endsWith('x100')
+      || (numericSample !== undefined && Math.abs(numericSample) >= 100);
+    if (looksLikeX100) {
+      return Math.round(temperatureC * 100);
+    }
+    return Math.round(temperatureC * 10) / 10;
+  }
+
   private async setTargetTemperature(value: CharacteristicValue): Promise<void> {
     const numericValue = parseCharacteristicNumber(value);
     if (numericValue === undefined) {
@@ -759,79 +781,39 @@ export class SalusPlatformAccessory {
     }
 
     const targetTemperature = clamp(numericValue, 4.5, 35);
-    const scaledX100 = Math.round(targetTemperature * 100);
-    const scaledPlain = Math.round(targetTemperature * 10) / 10;
-    const targetState = this.cachedTargetState;
-
-    const writes: Array<{ property: string; value: unknown }> = [];
-    const queuedProperties = new Set<string>();
-    const pickFirstProperty = (candidates: Array<string | undefined>): string | undefined => {
-      for (const candidate of candidates) {
-        if (candidate) {
-          return candidate;
-        }
-      }
-      return undefined;
-    };
-    const enqueueWrite = (property: string | undefined) => {
-      if (!property || queuedProperties.has(property)) {
-        return;
-      }
-      const sample = this.getPropertyValue(property);
-      const numericSample = parseNumberLike(sample);
-      const lowerProperty = property.toLowerCase();
-      const propertyNameLooksX100 = lowerProperty.includes('_x100') || lowerProperty.endsWith('x100');
-      const sampleLooksX100 = propertyNameLooksX100 || (numericSample !== undefined && Math.abs(numericSample) >= 100);
-      queuedProperties.add(property);
-      writes.push({ property, value: sampleLooksX100 ? scaledX100 : scaledPlain });
-    };
-    const enqueueFirstDiscovered = (baseNames: string[]) => {
-      enqueueWrite(findPropertyByBaseName(this.latestProperties, baseNames));
-    };
-
-    if (targetState === this.platform.Characteristic.TargetHeatingCoolingState.COOL) {
-      const primary = pickFirstProperty([
-        this.writeTargets.coolSetpoint,
-        this.writeTargets.autoCoolSetpoint,
-        this.writeTargets.heatSetpoint,
-      ]);
-      enqueueWrite(primary);
-      enqueueFirstDiscovered(THERMOSTAT_COOL_SETPOINT_COMMAND);
-      enqueueFirstDiscovered(THERMOSTAT_COOL_SETPOINT_EFFECTIVE);
-    } else if (targetState === this.platform.Characteristic.TargetHeatingCoolingState.AUTO) {
-      enqueueWrite(pickFirstProperty([this.writeTargets.autoHeatSetpoint, this.writeTargets.heatSetpoint]));
-      enqueueWrite(pickFirstProperty([this.writeTargets.autoCoolSetpoint, this.writeTargets.coolSetpoint]));
-      enqueueFirstDiscovered(THERMOSTAT_HEAT_SETPOINT_COMMAND);
-      enqueueFirstDiscovered(THERMOSTAT_HEAT_SETPOINT_EFFECTIVE);
-      enqueueFirstDiscovered(THERMOSTAT_COOL_SETPOINT_COMMAND);
-      enqueueFirstDiscovered(THERMOSTAT_COOL_SETPOINT_EFFECTIVE);
-    } else {
-      const primary = pickFirstProperty([
-        this.writeTargets.heatSetpoint,
-        this.writeTargets.autoHeatSetpoint,
-        this.writeTargets.coolSetpoint,
-        this.writeTargets.autoCoolSetpoint,
-      ]);
-      enqueueWrite(primary);
-      enqueueFirstDiscovered(THERMOSTAT_HEAT_SETPOINT_COMMAND);
-      enqueueFirstDiscovered(THERMOSTAT_HEAT_SETPOINT_EFFECTIVE);
-    }
-
-    if (writes.length === 0) {
+    const setpointProperty = this.firstDefined(
+      this.writeTargets.heatSetpoint,
+      this.writeTargets.autoHeatSetpoint,
+      findPropertyByBaseName(this.latestProperties, THERMOSTAT_HEAT_SETPOINT_COMMAND),
+      findPropertyByBaseName(this.latestProperties, THERMOSTAT_HEAT_SETPOINT_EFFECTIVE),
+      this.writeTargets.coolSetpoint,
+      this.writeTargets.autoCoolSetpoint,
+      findPropertyByBaseName(this.latestProperties, THERMOSTAT_COOL_SETPOINT_COMMAND),
+    );
+    if (!setpointProperty) {
       throw this.communicationFailure('No writable thermostat setpoint property was discovered');
     }
 
-    for (const write of writes) {
-      await this.platform.writeDeviceProperty(this.device, write.property, write.value);
+    const writes: Record<string, unknown> = {
+      [setpointProperty]: this.encodeThermostatTemperatureForProperty(setpointProperty, targetTemperature),
+    };
+
+    // Match Salus app behavior: changing target temperature forces working/manual mode.
+    if (this.writeTargets.systemMode) {
+      writes[this.writeTargets.systemMode] = SALUS_MODE.heat;
     }
-    await this.ensureThermostatTargetApplied(targetTemperature, targetState);
+    if (this.writeTargets.holdType) {
+      writes[this.writeTargets.holdType] = 2;
+    }
+
+    await this.platform.writeDeviceProperties(this.device, writes);
+    await this.ensureThermostatTargetApplied(targetTemperature);
+    this.cachedTargetState = this.platform.Characteristic.TargetHeatingCoolingState.HEAT;
+    this.cachedSystemMode = SALUS_MODE.heat;
     this.platform.log.info(`Set thermostat target for ${this.device.name} to ${targetTemperature.toFixed(1)}°C`);
   }
 
-  private async ensureThermostatTargetApplied(
-    expectedTemperatureC: number,
-    targetState: number,
-  ): Promise<void> {
+  private async ensureThermostatTargetApplied(expectedTemperatureC: number): Promise<void> {
     const maxAttempts = 10;
     const toleranceC = 0.4;
     let lastObserved: number | undefined;
@@ -842,12 +824,8 @@ export class SalusPlatformAccessory {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         const properties = await this.platform.readDeviceProperties(this.device);
-        const primaryObserved = targetState === this.platform.Characteristic.TargetHeatingCoolingState.COOL
-          ? getNumberProperty(properties, THERMOSTAT_COOL_SETPOINT_EFFECTIVE)
-          : getNumberProperty(properties, THERMOSTAT_HEAT_SETPOINT_EFFECTIVE);
-        const commandObserved = targetState === this.platform.Characteristic.TargetHeatingCoolingState.COOL
-          ? getNumberProperty(properties, THERMOSTAT_COOL_SETPOINT_COMMAND)
-          : getNumberProperty(properties, THERMOSTAT_HEAT_SETPOINT_COMMAND);
+        const primaryObserved = getNumberProperty(properties, THERMOSTAT_HEAT_SETPOINT_EFFECTIVE);
+        const commandObserved = getNumberProperty(properties, THERMOSTAT_HEAT_SETPOINT_COMMAND);
 
         const primaryC = primaryObserved === undefined ? undefined : clamp(normalizeTemperatureFromX100(primaryObserved), 4.5, 35);
         const commandC = commandObserved === undefined ? undefined : clamp(normalizeTemperatureFromX100(commandObserved), 4.5, 35);
@@ -863,8 +841,7 @@ export class SalusPlatformAccessory {
         }
 
         const primaryMatches = primaryC !== undefined && Math.abs(primaryC - expectedTemperatureC) <= toleranceC;
-        const commandMatches = commandC !== undefined && Math.abs(commandC - expectedTemperatureC) <= toleranceC;
-        if (primaryMatches || commandMatches) {
+        if (primaryMatches) {
           return;
         }
       } catch (error) {
@@ -907,25 +884,16 @@ export class SalusPlatformAccessory {
       throw this.communicationFailure('No writable thermostat mode/standby property was discovered');
     }
 
-    const holdTypeCurrent = getNumberProperty(this.latestProperties, THERMOSTAT_HOLD_TYPE);
-    if (mode !== SALUS_MODE.off && this.writeTargets.holdType && holdTypeCurrent !== undefined && Math.round(holdTypeCurrent) === 7) {
-      try {
-        await this.platform.writeDeviceProperty(this.device, this.writeTargets.holdType, 0);
-      } catch (error) {
-        this.platform.log.warn(`Unable to clear thermostat hold type for ${this.device.name}: ${asErrorMessage(error)}`);
-      }
-    }
+    const writes: Record<string, unknown> = {};
     if (this.writeTargets.systemMode) {
-      await this.platform.writeDeviceProperty(this.device, this.writeTargets.systemMode, mode);
+      writes[this.writeTargets.systemMode] = mode;
     }
-
-    if (mode === SALUS_MODE.off && this.writeTargets.holdType) {
-      try {
-        await this.platform.writeDeviceProperty(this.device, this.writeTargets.holdType, 7);
-      } catch (error) {
-        this.platform.log.warn(`Unable to apply thermostat off hold for ${this.device.name}: ${asErrorMessage(error)}`);
-      }
+    if (this.writeTargets.holdType) {
+      // HomeKit mode mapping requested by user:
+      // OFF -> standby (7), HEAT -> working/manual (2).
+      writes[this.writeTargets.holdType] = requestedOff ? 7 : 2;
     }
+    await this.platform.writeDeviceProperties(this.device, writes);
 
     this.cachedTargetState = hkState;
     this.cachedSystemMode = mode;

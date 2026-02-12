@@ -2,7 +2,7 @@
   "name": "homebridge-salus-cloud",
   "displayName": "Salus Cloud",
   "type": "module",
-  "version": "0.1.37",
+  "version": "0.1.38",
   "description": "Cloud-only Salus Connect Homebridge platform with automatic discovery and HomeKit control.",
   "author": "Marcel",
   "license": "Apache-2.0",
@@ -37,7 +37,9 @@
     "publish:plugin:dry-run": "bash ./scripts/publish.sh --dry-run",
     "watch": "npm run build && npm link && nodemon"
   },
-  "dependencies": {},
+  "dependencies": {
+    "mqtt": "^5.14.1"
+  },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
     "@types/node": "^24.10.1",

@@ -206,15 +206,31 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
   }
 
   public async writeDeviceProperty(device: SalusDevice, propertyName: string, value: unknown): Promise<void> {
+    await this.writeDeviceProperties(device, { [propertyName]: value });
+  }
+
+  public async writeDeviceProperties(device: SalusDevice, properties: Record<string, unknown>): Promise<void> {
     if (!this.cloudClient) {
       throw new Error('Salus cloud client is not initialized due to missing credentials.');
     }
+    const entries = Object.entries(properties).filter(([name]) => name.trim() !== '');
+    if (entries.length === 0) {
+      throw new Error(`No writable properties were provided for ${device.name} (${device.dsn}).`);
+    }
+
     try {
-      await this.cloudClient.setDatapoint(device.dsn, propertyName, value);
-      this.log.debug(`Set datapoint ${propertyName}=${JSON.stringify(value)} for ${device.name} (${device.dsn})`);
+      await this.cloudClient.setDatapoints(device.dsn, Object.fromEntries(entries));
+      if (entries.length === 1) {
+        const [propertyName, value] = entries[0]!;
+        this.log.debug(`Set datapoint ${propertyName}=${JSON.stringify(value)} for ${device.name} (${device.dsn})`);
+      } else {
+        const summary = entries.map(([name, value]) => `${name}=${JSON.stringify(value)}`).join(', ');
+        this.log.debug(`Set ${entries.length} datapoints for ${device.name} (${device.dsn}): ${summary}`);
+      }
       this.schedulePoll(2_000);
     } catch (error) {
-      this.log.error(`Failed to set datapoint ${propertyName} on ${device.name}: ${asErrorMessage(error)}`);
+      const summary = entries.map(([name, value]) => `${name}=${JSON.stringify(value)}`).join(', ');
+      this.log.error(`Failed to set datapoint(s) on ${device.name}: ${summary}. ${asErrorMessage(error)}`);
       throw error;
     }
   }

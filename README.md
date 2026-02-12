@@ -25,8 +25,9 @@ The plugin follows the app's modern cloud stack:
 - Service API fallback: `/api/v2`
 - Discovery endpoints (in order): `GET /api/v1/occupants/slider_list` + `GET /api/v1/occupants/slider_details?id=...&type=gateway`, then fallback `GET /devices/`
 - Property shadow endpoint: `POST /devices/device_shadows` with `{ "device_codes": [...] }` (with compatibility fallback shapes)
-- Control write endpoint (primary): AWS IoT thing-shadow `POST /things/{dsn}/shadow` with SigV4 signing, using temporary credentials from Cognito Identity
-- Control write endpoint (fallback): `POST /devices/bulk` and `PATCH /devices/device_shadows` payload variants for compatibility fallback
+- Control write endpoint (primary): AWS IoT shadow MQTT publish to `$aws/things/{dsn}/shadow/update` over SigV4-signed WebSocket, using temporary credentials from Cognito Identity
+- Control write endpoint (secondary fallback): AWS IoT thing-shadow `POST /things/{dsn}/shadow` with SigV4 signing
+- Control write endpoint (compatibility fallback): `POST /devices/bulk` and `PATCH /devices/device_shadows` payload variants
 
 ## Install
 
@@ -107,12 +108,13 @@ Examples:
 - Bounded `occupants/slider_details` traversal per poll (target-count + time budget) to avoid long stalls during upstream `5xx` bursts.
 - Automatic compatibility fallback to legacy Salus cloud auth/API (multi-path legacy sign-in probe + `/apiv1`) when modern API returns persistent authorization errors (for example `response_code=900008`).
 - Flexible shadow parser for multiple payload shapes.
-- Primary write path matches Salus app behavior via AWS IoT thing-shadow updates (`state.desired.<baseKey>.properties`).
+- Primary write path matches Salus app behavior via AWS IoT MQTT shadow updates (`$aws/things/{dsn}/shadow/update` with `state.desired.<baseKey>.properties`).
+- Automatic MQTT write retries for transient connection issues and AWS credential refresh on authorization failures.
 - Automatic AWS IoT credential refresh and signing-service fallback (`iotdevicegateway` -> `iotdata`) for tenant variations.
 - Service API write payload fallbacks remain enabled as a compatibility safety net.
 - Per-poll property refresh (with cached fallback on transient errors) to keep HomeKit target/current values up-to-date.
 - Thermostat write confirmation loop verifies that setpoint actually changed in cloud state; failed convergence is surfaced as HomeKit communication failure instead of silent no-op.
-- Thermostat setpoint writes mirror both effective and command fields (`HeatingSetpoint*` + `SetHeatingSetpoint*`) to keep Salus app and Home app in sync when the cloud updates them asynchronously.
+- Thermostat setpoint writes use command datapoints (`SetHeatingSetpoint*`) together with manual/working mode hints (`SetHoldType=2`, `SetSystemMode=4`) to match Salus app behavior.
 - Device online state is inferred from Salus connectivity datapoints (`connected`, `OnlineState`, `OnlineStatus_i`, etc.) and mapped to HomeKit reachability so disconnected devices can show as not responding.
 - Immediate short re-poll after write to keep HomeKit state aligned.
 - Detailed logs for auth, discovery, shadow sync, writes, retries, and failures.
@@ -122,7 +124,7 @@ Examples:
 For Salus thermostat UX parity (standby/working):
 
 - HomeKit `Off` -> Salus standby (`HoldType=7`, no active heating)
-- HomeKit `Heat` -> Salus working mode
+- HomeKit `Heat` -> Salus working/manual mode (`HoldType=2`, `SystemMode=4`)
 - HomeKit `Cool` / `Auto` requests are forced to `Heat`
 
 Target mode characteristic is constrained to `Off` + `Heat` to avoid unsupported mode selection in Home app.

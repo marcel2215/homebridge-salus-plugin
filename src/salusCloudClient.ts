@@ -3,6 +3,7 @@
 import type { Logging } from 'homebridge';
 import process from 'node:process';
 import crypto from 'node:crypto';
+import * as mqtt from 'mqtt';
 
 import { baseNameForProperty, normalizeModelName, parseBooleanLike, parseNumberLike } from './propertyUtils.js';
 import type {
@@ -142,6 +143,7 @@ const SESSION_REFRESH_SAFETY_MS = 60_000;
 const LEGACY_SESSION_REFRESH_SAFETY_MS = 60_000;
 const LEGACY_DEFAULT_SESSION_TTL_MS = 45 * 60_000;
 const AWS_IOT_CREDENTIAL_REFRESH_SAFETY_MS = 60_000;
+const MQTT_MIN_CONNECT_TIMEOUT_MS = 10_000;
 const MAX_UNAUTHORIZED_RECOVERY_STEPS = 48;
 const SLIDER_DETAILS_BLOCK_TTL_MS = 15 * 60_000;
 const DEVICE_SHADOW_BLOCK_TTL_MS = 15 * 60_000;
@@ -938,22 +940,41 @@ export class SalusCloudClient {
   }
 
   public async setDatapoint(dsn: string, propertyName: string, value: unknown): Promise<void> {
+    await this.setDatapoints(dsn, { [propertyName]: value });
+  }
+
+  public async setDatapoints(dsn: string, properties: Record<string, unknown>): Promise<void> {
+    const normalizedEntries = Object.entries(properties).filter(([name]) => normalizeNonEmptyString(name) !== undefined);
+    if (normalizedEntries.length === 0) {
+      throw new Error(`No datapoints were provided for ${dsn}.`);
+    }
+
     if (this.apiTransportMode === 'legacy') {
-      await this.setDatapointLegacy(dsn, propertyName, value);
+      for (const [propertyName, value] of normalizedEntries) {
+        await this.setDatapointLegacy(dsn, propertyName, value);
+      }
       return;
     }
 
     try {
-      await this.setDatapointModern(dsn, propertyName, value);
+      if (normalizedEntries.length === 1) {
+        const [propertyName, value] = normalizedEntries[0]!;
+        await this.setDatapointModern(dsn, propertyName, value);
+      } else {
+        await this.setDatapointsModern(dsn, Object.fromEntries(normalizedEntries));
+      }
       return;
     } catch (error) {
       if (!shouldSwitchToLegacyApi(error)) {
         throw error;
       }
 
-      const reason = `Modern Salus datapoint write failed for ${dsn}/${propertyName}: ${asErrorMessage(error)}`;
+      const summary = normalizedEntries.map(([name]) => name).join(', ');
+      const reason = `Modern Salus datapoint write failed for ${dsn} (${summary}): ${asErrorMessage(error)}`;
       try {
-        await this.setDatapointLegacy(dsn, propertyName, value);
+        for (const [propertyName, value] of normalizedEntries) {
+          await this.setDatapointLegacy(dsn, propertyName, value);
+        }
         this.switchToLegacyTransport(reason);
       } catch (legacyError) {
         throw new Error(`${reason}. Legacy compatibility write probe failed: ${asErrorMessage(legacyError)}`);
@@ -961,11 +982,72 @@ export class SalusCloudClient {
     }
   }
 
-  private async setDatapointModern(dsn: string, propertyName: string, value: unknown): Promise<void> {
-    const writeCacheKey = `${dsn}:${propertyName}`;
-    const iotAttemptDescription = 'AWS IoT thing shadow update';
+  private async setDatapointsModern(dsn: string, properties: Record<string, unknown>): Promise<void> {
     const failures: string[] = [];
 
+    try {
+      await this.setDatapointsViaAwsIotMqttShadow(dsn, properties);
+      for (const [propertyName, value] of Object.entries(properties)) {
+        this.updateCachedProperty(dsn, propertyName, value);
+      }
+      if (this.verboseLogging) {
+        this.log.debug(`Write succeeded via AWS IoT MQTT shadow publish for ${dsn}`);
+      }
+      return;
+    } catch (error) {
+      failures.push(`AWS IoT MQTT shadow publish -> ${asErrorMessage(error)}`);
+      if (this.verboseLogging) {
+        this.log.debug(`MQTT batch write failed for ${dsn}: ${asErrorMessage(error)}. Falling back to HTTP IoT shadow update.`);
+      }
+    }
+
+    try {
+      await this.setDatapointsViaAwsIotShadow(dsn, properties);
+      for (const [propertyName, value] of Object.entries(properties)) {
+        this.updateCachedProperty(dsn, propertyName, value);
+      }
+      if (this.verboseLogging) {
+        this.log.debug(`Write succeeded via AWS IoT HTTP shadow update for ${dsn}`);
+      }
+      return;
+    } catch (error) {
+      failures.push(`AWS IoT HTTP shadow update -> ${asErrorMessage(error)}`);
+      if (this.verboseLogging) {
+        this.log.debug(`HTTP IoT batch write failed for ${dsn}: ${asErrorMessage(error)}. Falling back to individual write probes.`);
+      }
+    }
+
+    for (const [propertyName, value] of Object.entries(properties)) {
+      try {
+        await this.setDatapointModern(dsn, propertyName, value);
+      } catch (error) {
+        failures.push(`${propertyName} -> ${asErrorMessage(error)}`);
+        throw new Error(`Failed to write datapoint batch for ${dsn}. Attempts: ${failures.join(' | ')}`);
+      }
+    }
+  }
+
+  private async setDatapointModern(dsn: string, propertyName: string, value: unknown): Promise<void> {
+    const writeCacheKey = `${dsn}:${propertyName}`;
+    const failures: string[] = [];
+
+    try {
+      const mqttAttemptDescription = 'AWS IoT MQTT shadow publish';
+      await this.setDatapointsViaAwsIotMqttShadow(dsn, { [propertyName]: value });
+      this.updateCachedProperty(dsn, propertyName, value);
+      this.rememberPreferredWriteAttempt(writeCacheKey, mqttAttemptDescription);
+      if (this.verboseLogging) {
+        this.log.debug(`Write succeeded via ${mqttAttemptDescription}`);
+      }
+      return;
+    } catch (error) {
+      failures.push(`AWS IoT MQTT shadow publish -> ${asErrorMessage(error)}`);
+      if (this.verboseLogging) {
+        this.log.debug(`MQTT write failed for ${dsn}/${propertyName}: ${asErrorMessage(error)}. Falling back to HTTP IoT shadow update.`);
+      }
+    }
+
+    const iotAttemptDescription = 'AWS IoT HTTP shadow update';
     try {
       await this.setDatapointViaAwsIotShadow(dsn, propertyName, value);
       this.updateCachedProperty(dsn, propertyName, value);
@@ -1033,8 +1115,23 @@ export class SalusCloudClient {
   }
 
   private async setDatapointViaAwsIotShadow(dsn: string, propertyName: string, value: unknown): Promise<void> {
-    const context = await this.resolveShadowWriteContextForDatapoint(dsn, propertyName);
-    const propertyUpdates = Object.fromEntries(context.propertyNames.map((name) => [name, value]));
+    await this.setDatapointsViaAwsIotShadow(dsn, { [propertyName]: value });
+  }
+
+  private async setDatapointsViaAwsIotShadow(dsn: string, properties: Record<string, unknown>): Promise<void> {
+    const firstPropertyName = normalizeNonEmptyString(Object.keys(properties)[0]);
+    if (!firstPropertyName) {
+      throw new Error(`Cannot send AWS IoT shadow update for ${dsn}: no properties were provided.`);
+    }
+
+    const context = await this.resolveShadowWriteContextForDatapoint(dsn, firstPropertyName);
+    const propertyUpdates: Record<string, unknown> = {};
+    for (const [propertyName, value] of Object.entries(properties)) {
+      for (const variant of this.buildShadowPropertyWriteVariants(propertyName)) {
+        propertyUpdates[variant] = value;
+      }
+    }
+
     const desired: Record<string, unknown> = {};
 
     if (context.includeRootProperties) {
@@ -1054,12 +1151,232 @@ export class SalusCloudClient {
 
     if (this.verboseLogging) {
       this.log.debug(
-        `AWS IoT write context for ${dsn}/${propertyName}: branches=[${context.branchKeys.join(', ')}], `
-        + `rootProperties=${context.includeRootProperties}, properties=[${context.propertyNames.join(', ')}]`,
+        `AWS IoT write context for ${dsn}: branches=[${context.branchKeys.join(', ')}], `
+        + `rootProperties=${context.includeRootProperties}, properties=[${Object.keys(propertyUpdates).join(', ')}]`,
       );
     }
 
     await this.requestAwsIotShadowUpdate(dsn, { state: { desired } });
+  }
+
+  private async setDatapointsViaAwsIotMqttShadow(dsn: string, properties: Record<string, unknown>): Promise<void> {
+    const firstPropertyName = normalizeNonEmptyString(Object.keys(properties)[0]);
+    if (!firstPropertyName) {
+      throw new Error(`Cannot publish AWS IoT MQTT shadow update for ${dsn}: no properties were provided.`);
+    }
+
+    const context = await this.resolveShadowWriteContextForDatapoint(dsn, firstPropertyName);
+    const propertyUpdates: Record<string, unknown> = {};
+    for (const [propertyName, value] of Object.entries(properties)) {
+      for (const variant of this.buildShadowPropertyWriteVariants(propertyName)) {
+        propertyUpdates[variant] = value;
+      }
+    }
+
+    const desired: Record<string, unknown> = {};
+    if (context.includeRootProperties) {
+      desired.properties = propertyUpdates;
+    }
+    for (const branchKey of context.branchKeys) {
+      desired[branchKey] = {
+        properties: propertyUpdates,
+      };
+    }
+    if (Object.keys(desired).length === 0) {
+      desired['11'] = {
+        properties: propertyUpdates,
+      };
+    }
+
+    const payloadText = JSON.stringify({ state: { desired } });
+    const topic = `$aws/things/${dsn}/shadow/update`;
+    const totalAttempts = this.maxRetries + 1;
+    let lastError: unknown = new Error(`No AWS IoT MQTT response received for ${dsn}`);
+    let forceCredentialRefresh = false;
+
+    for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+      try {
+        const credentials = await this.ensureAwsIotCredentials(forceCredentialRefresh);
+        forceCredentialRefresh = false;
+        const mqttUrl = this.buildAwsIotMqttWebsocketUrl(credentials);
+        await this.publishAwsIotMqttShadowUpdate(topic, payloadText, this.resolveGatewayThingCodeForDsn(dsn), mqttUrl);
+        if (this.verboseLogging) {
+          this.log.debug(`AWS IoT MQTT shadow publish succeeded for ${dsn}`);
+        }
+        return;
+      } catch (error) {
+        lastError = error;
+        if (isMqttUnauthorizedError(error)) {
+          this.awsIotCredentials = null;
+          this.awsIdentityId = null;
+          forceCredentialRefresh = true;
+        }
+        if (attempt < totalAttempts && (forceCredentialRefresh || isMqttRetryableError(error))) {
+          await this.retryDelay(attempt, `AWS IoT MQTT shadow publish failed: ${asErrorMessage(error)}`);
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    throw new Error(`AWS IoT MQTT shadow publish exhausted retries for ${dsn}: ${asErrorMessage(lastError)}`);
+  }
+
+  private buildAwsIotMqttWebsocketUrl(credentials: AwsIotCredentials): string {
+    const now = new Date();
+    const amzDate = formatAwsAmzDate(now);
+    const dateStamp = formatAwsDateStamp(now);
+    const serviceName = DEFAULT_AWS_IOT_SERVICE;
+    const algorithm = 'AWS4-HMAC-SHA256';
+    const credentialScope = `${dateStamp}/${this.awsIotRegion}/${serviceName}/aws4_request`;
+
+    const queryParams: Array<[string, string]> = [
+      ['X-Amz-Algorithm', algorithm],
+      ['X-Amz-Credential', `${credentials.accessKeyId}/${credentialScope}`],
+      ['X-Amz-Date', amzDate],
+      ['X-Amz-SignedHeaders', 'host'],
+    ];
+    const canonicalQueryString = queryParams
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, value]) => `${awsPercentEncode(key)}=${awsPercentEncode(value)}`)
+      .join('&');
+
+    const canonicalRequest = [
+      'GET',
+      '/mqtt',
+      canonicalQueryString,
+      `host:${this.awsIotEndpointHost}\n`,
+      'host',
+      sha256Hex(''),
+    ].join('\n');
+
+    const stringToSign = [
+      algorithm,
+      amzDate,
+      credentialScope,
+      sha256Hex(canonicalRequest),
+    ].join('\n');
+
+    const signingKey = deriveAwsSigningKey(credentials.secretAccessKey, dateStamp, this.awsIotRegion, serviceName);
+    const signature = hmacSha256Hex(signingKey, stringToSign);
+    let signedQueryString = `${canonicalQueryString}&X-Amz-Signature=${signature}`;
+
+    // Match the proven salus-it600-cloud behavior: append session token after signing.
+    signedQueryString += `&X-Amz-Security-Token=${awsPercentEncode(credentials.sessionToken)}`;
+    return `wss://${this.awsIotEndpointHost}/mqtt?${signedQueryString}`;
+  }
+
+  private async publishAwsIotMqttShadowUpdate(
+    topic: string,
+    payloadText: string,
+    gatewayThingCode: string | undefined,
+    url: string,
+  ): Promise<void> {
+    const connectTimeoutMs = Math.max(MQTT_MIN_CONNECT_TIMEOUT_MS, this.requestTimeoutMs);
+    const clientIdPrefix = sanitizeMqttClientIdSegment(gatewayThingCode ?? 'homebridge-salus-cloud');
+    const clientId = `${clientIdPrefix}-${crypto.randomUUID()}`;
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: unknown) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timeout);
+        client.removeListener('connect', onConnect);
+        client.removeListener('error', onError);
+        client.removeListener('close', onClose);
+        client.removeListener('offline', onOffline);
+        try {
+          client.end(true);
+        } catch {
+          // Ignore close failures in cleanup path.
+        }
+
+        if (error) {
+          reject(error instanceof Error ? error : new Error(String(error)));
+          return;
+        }
+        resolve();
+      };
+
+      const onConnect = () => {
+        client.publish(topic, payloadText, { qos: 1 }, (error) => {
+          if (error) {
+            finish(new Error(`MQTT publish failed on ${topic}: ${asErrorMessage(error)}`));
+            return;
+          }
+          finish();
+        });
+      };
+
+      const onError = (error: unknown) => {
+        finish(new Error(`MQTT connection error: ${asErrorMessage(error)}`));
+      };
+
+      const onClose = () => {
+        if (settled) {
+          return;
+        }
+        finish(new Error('MQTT connection closed before publish acknowledgement.'));
+      };
+
+      const onOffline = () => {
+        if (settled) {
+          return;
+        }
+        finish(new Error('MQTT connection went offline before publish acknowledgement.'));
+      };
+
+      const timeout = setTimeout(() => {
+        finish(new Error(`MQTT publish timed out after ${connectTimeoutMs}ms.`));
+      }, connectTimeoutMs);
+
+      const client = mqtt.connect(url, {
+        clientId,
+        protocolVersion: 4,
+        clean: true,
+        resubscribe: false,
+        keepalive: 60,
+        reconnectPeriod: 0,
+        connectTimeout: connectTimeoutMs,
+        rejectUnauthorized: !this.allowInsecureTls,
+        wsOptions: {
+          headers: {
+            'Sec-WebSocket-Protocol': 'mqtt',
+          },
+        },
+      });
+
+      client.on('connect', onConnect);
+      client.on('error', onError);
+      client.on('close', onClose);
+      client.on('offline', onOffline);
+    });
+  }
+
+  private resolveGatewayThingCodeForDsn(dsn: string): string | undefined {
+    const fromTarget = extractGatewayThingCodeFromDsn(dsn);
+    if (fromTarget) {
+      return fromTarget;
+    }
+
+    for (const mappedDsn of this.deviceIdToDsn.values()) {
+      const candidate = extractGatewayThingCodeFromDsn(mappedDsn);
+      if (candidate) {
+        return candidate;
+      }
+    }
+
+    for (const device of this.lastKnownDevices) {
+      const candidate = extractGatewayThingCodeFromDsn(device.dsn);
+      if (candidate) {
+        return candidate;
+      }
+    }
+
+    return undefined;
   }
 
   private async resolveShadowWriteContextForDatapoint(dsn: string, propertyName: string): Promise<AwsShadowWriteContext> {
@@ -3301,6 +3618,81 @@ function dedupeStringArray(values: string[]): string[] {
     deduped.push(value);
   }
   return deduped;
+}
+
+function awsPercentEncode(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (char) =>
+    `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function sanitizeMqttClientIdSegment(value: string): string {
+  const normalized = value
+    .trim()
+    .replaceAll(/[^A-Za-z0-9_-]+/g, '_')
+    .replaceAll(/_+/g, '_')
+    .replaceAll(/^-+|-+$/g, '');
+  if (!normalized) {
+    return 'homebridge-salus-cloud';
+  }
+  // Keep enough room for the random UUID suffix.
+  return normalized.slice(0, 80);
+}
+
+function extractGatewayThingCodeFromDsn(dsn: string): string | undefined {
+  const normalized = normalizeNonEmptyString(dsn);
+  if (!normalized) {
+    return undefined;
+  }
+
+  const directMatch = normalized.match(/^([A-Za-z0-9]+_GW-[A-Za-z0-9]+)/i);
+  if (directMatch?.[1]) {
+    return directMatch[1];
+  }
+
+  const pivot = normalized.indexOf('_GW-');
+  if (pivot <= 0) {
+    return undefined;
+  }
+
+  const suffix = normalized.slice(pivot + 4);
+  const firstToken = suffix.split('-')[0]?.trim();
+  if (!firstToken) {
+    return undefined;
+  }
+
+  const prefix = normalized.slice(0, pivot);
+  return `${prefix}_GW-${firstToken}`;
+}
+
+function isMqttUnauthorizedError(error: unknown): boolean {
+  const message = asErrorMessage(error).toLowerCase();
+  return message.includes('not authorized')
+    || message.includes('unauthorized')
+    || message.includes('connection refused: 5');
+}
+
+function isMqttRetryableError(error: unknown): boolean {
+  if (isRetriableFailure(error)) {
+    return true;
+  }
+
+  const message = asErrorMessage(error).toLowerCase();
+  const retryableHints = [
+    'timed out',
+    'timeout',
+    'connection reset',
+    'connection closed',
+    'socket',
+    'offline',
+    'temporarily unavailable',
+    'network',
+    'econnreset',
+    'econnrefused',
+    'ehostunreach',
+    'enotfound',
+    'etimedout',
+  ];
+  return retryableHints.some((hint) => message.includes(hint));
 }
 
 function buildServiceUrl(baseUrl: string, path: string, addTimestamp: boolean): string {
