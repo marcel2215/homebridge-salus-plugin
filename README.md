@@ -25,7 +25,8 @@ The plugin follows the app's modern cloud stack:
 - Service API fallback: `/api/v2`
 - Discovery endpoints (in order): `GET /api/v1/occupants/slider_list` + `GET /api/v1/occupants/slider_details?id=...&type=gateway`, then fallback `GET /devices/`
 - Property shadow endpoint: `POST /devices/device_shadows` with `{ "device_codes": [...] }` (with compatibility fallback shapes)
-- Control write endpoint (primary): `POST /devices/bulk` (with fallback payload shapes)
+- Control write endpoint (primary): AWS IoT thing-shadow `POST /things/{dsn}/shadow` with SigV4 signing, using temporary credentials from Cognito Identity
+- Control write endpoint (fallback): `POST /devices/bulk` and `PATCH /devices/device_shadows` payload variants for compatibility fallback
 
 ## Install
 
@@ -59,7 +60,11 @@ homebridge -D
   "allowInsecureTls": false,
   "apiVersionPreference": "auto",
   "cognitoRegion": "eu-central-1",
-  "cognitoClientId": "4pk5efh3v84g5dav43imsv4fbj"
+  "cognitoClientId": "4pk5efh3v84g5dav43imsv4fbj",
+  "awsIdentityPoolId": "eu-central-1:60912c00-287d-413b-a2c9-ece3ccef9230",
+  "awsIotEndpointHost": "a24u3z7zzwrtdl-ats.iot.eu-central-1.amazonaws.com",
+  "awsIotRegion": "eu-central-1",
+  "awsIotServiceName": "iotdevicegateway"
 }
 ```
 
@@ -69,6 +74,10 @@ homebridge -D
 - `apiVersionPreference`: `auto`, `v1`, or `v2`.
 - `cognitoRegion`: Override AWS Cognito region.
 - `cognitoClientId`: Override Cognito app client ID.
+- `awsIdentityPoolId`: Override Cognito Identity pool id used for AWS IoT credential exchange.
+- `awsIotEndpointHost`: Override AWS IoT data endpoint host (no path).
+- `awsIotRegion`: Override AWS IoT SigV4 signing region.
+- `awsIotServiceName`: Override AWS IoT SigV4 service (`iotdevicegateway` by default, falls back to `iotdata` automatically).
 - `companyCode`: Optional `x-company-code` override (for example `salus-eu`, `salus-us`, `heatlink_us`). If omitted, the plugin now starts with region defaults (`salus-eu` / `salus-us`) and only then tries alternatives.
 - `allowInsecureTls`: Only for certificate troubleshooting (not recommended long-term).
 
@@ -98,9 +107,21 @@ Examples:
 - Bounded `occupants/slider_details` traversal per poll (target-count + time budget) to avoid long stalls during upstream `5xx` bursts.
 - Automatic compatibility fallback to legacy Salus cloud auth/API (multi-path legacy sign-in probe + `/apiv1`) when modern API returns persistent authorization errors (for example `response_code=900008`).
 - Flexible shadow parser for multiple payload shapes.
-- Flexible write payload fallback for service-api compatibility changes.
+- Primary write path matches Salus app behavior via AWS IoT thing-shadow updates (`state.desired.<baseKey>.properties`).
+- Automatic AWS IoT credential refresh and signing-service fallback (`iotdevicegateway` -> `iotdata`) for tenant variations.
+- Service API write payload fallbacks remain enabled as a compatibility safety net.
 - Immediate short re-poll after write to keep HomeKit state aligned.
 - Detailed logs for auth, discovery, shadow sync, writes, retries, and failures.
+
+## Thermostat mode mapping
+
+For Salus thermostat UX parity (standby/working):
+
+- HomeKit `Off` -> Salus standby (`HoldType=7`, no active heating)
+- HomeKit `Heat` -> Salus working mode
+- HomeKit `Cool` / `Auto` requests are forced to `Heat`
+
+Target mode characteristic is constrained to `Off` + `Heat` to avoid unsupported mode selection in Home app.
 
 ## 900008 troubleshooting
 

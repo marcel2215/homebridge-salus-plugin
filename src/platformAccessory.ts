@@ -332,7 +332,12 @@ export class SalusPlatformAccessory {
       minStep: 0.5,
     }).onSet(this.setTargetTemperature.bind(this));
 
-    this.service.getCharacteristic(this.platform.Characteristic.TargetHeatingCoolingState).onSet(this.setTargetHeatingCoolingState.bind(this));
+    this.service.getCharacteristic(this.platform.Characteristic.TargetHeatingCoolingState).setProps({
+      validValues: [
+        this.platform.Characteristic.TargetHeatingCoolingState.OFF,
+        this.platform.Characteristic.TargetHeatingCoolingState.HEAT,
+      ],
+    }).onSet(this.setTargetHeatingCoolingState.bind(this));
   }
 
   private configureSwitch(): void {
@@ -463,11 +468,7 @@ export class SalusPlatformAccessory {
     this.cachedTargetState = targetState;
 
     let targetTemp: number | undefined;
-    if (targetState === this.platform.Characteristic.TargetHeatingCoolingState.COOL) {
-      targetTemp = coolingSetpoint ?? heatingSetpoint;
-    } else {
-      targetTemp = heatingSetpoint ?? coolingSetpoint;
-    }
+    targetTemp = heatingSetpoint ?? coolingSetpoint;
     if (targetTemp === undefined) {
       targetTemp = currentTemp;
     }
@@ -781,21 +782,14 @@ export class SalusPlatformAccessory {
       throw this.communicationFailure('Received invalid thermostat mode value from HomeKit');
     }
     const hkStateRounded = Math.round(hkStateRaw);
-    let hkState = this.platform.Characteristic.TargetHeatingCoolingState.AUTO;
-    let mode = SALUS_MODE.auto;
-    if (hkStateRounded === this.platform.Characteristic.TargetHeatingCoolingState.OFF) {
-      hkState = this.platform.Characteristic.TargetHeatingCoolingState.OFF;
-      mode = SALUS_MODE.off;
-    } else if (hkStateRounded === this.platform.Characteristic.TargetHeatingCoolingState.COOL) {
-      hkState = this.platform.Characteristic.TargetHeatingCoolingState.COOL;
-      mode = SALUS_MODE.cool;
-    } else if (hkStateRounded === this.platform.Characteristic.TargetHeatingCoolingState.HEAT) {
-      hkState = this.platform.Characteristic.TargetHeatingCoolingState.HEAT;
-      mode = SALUS_MODE.heat;
-    }
+    const requestedOff = hkStateRounded === this.platform.Characteristic.TargetHeatingCoolingState.OFF;
+    const hkState = requestedOff
+      ? this.platform.Characteristic.TargetHeatingCoolingState.OFF
+      : this.platform.Characteristic.TargetHeatingCoolingState.HEAT;
+    const mode = requestedOff ? SALUS_MODE.off : SALUS_MODE.heat;
 
-    if (!this.writeTargets.systemMode) {
-      throw this.communicationFailure('No writable system mode property was discovered');
+    if (!this.writeTargets.systemMode && !this.writeTargets.holdType) {
+      throw this.communicationFailure('No writable thermostat mode/standby property was discovered');
     }
 
     const holdTypeCurrent = getNumberProperty(this.latestProperties, THERMOSTAT_HOLD_TYPE);
@@ -806,7 +800,9 @@ export class SalusPlatformAccessory {
         this.platform.log.warn(`Unable to clear thermostat hold type for ${this.device.name}: ${asErrorMessage(error)}`);
       }
     }
-    await this.platform.writeDeviceProperty(this.device, this.writeTargets.systemMode, mode);
+    if (this.writeTargets.systemMode) {
+      await this.platform.writeDeviceProperty(this.device, this.writeTargets.systemMode, mode);
+    }
 
     if (mode === SALUS_MODE.off && this.writeTargets.holdType) {
       try {
@@ -818,7 +814,12 @@ export class SalusPlatformAccessory {
 
     this.cachedTargetState = hkState;
     this.cachedSystemMode = mode;
-    this.platform.log.info(`Set thermostat mode for ${this.device.name} to ${hkState}`);
+    const modeLabel = hkState === this.platform.Characteristic.TargetHeatingCoolingState.OFF
+      ? 'off (standby)'
+      : 'heat (working)';
+    this.platform.log.info(
+      `Set thermostat mode for ${this.device.name} to ${modeLabel}`,
+    );
   }
 
   private async setOnOff(value: CharacteristicValue): Promise<void> {
@@ -1025,13 +1026,9 @@ function mapSystemModeToTargetState(
   if (systemMode === SALUS_MODE.off) {
     return characteristic.OFF;
   }
-  if (systemMode === SALUS_MODE.cool) {
-    return characteristic.COOL;
-  }
-  if (systemMode === SALUS_MODE.heat || systemMode === 5) {
-    return characteristic.HEAT;
-  }
-  return characteristic.AUTO;
+  // Salus consumer thermostat UX is effectively standby vs working.
+  // HomeKit modes beyond OFF/HEAT are collapsed to HEAT.
+  return characteristic.HEAT;
 }
 
 function mapRunningStateToCurrentState(
@@ -1050,21 +1047,7 @@ function mapRunningStateToCurrentState(
   if (!Number.isFinite(normalized) || normalized <= 0) {
     return characteristic.OFF;
   }
-  if (normalized === 1 || normalized === 4) {
-    return characteristic.HEAT;
-  }
-  if (normalized === 2 || normalized === 3) {
-    return characteristic.COOL;
-  }
-
-  const asBits = normalized.toString(2).padStart(8, '0').split('').reverse();
-  if (asBits[0] === '1' || asBits[4] === '1') {
-    return characteristic.HEAT;
-  }
-  if (asBits[1] === '1' || asBits[3] === '1') {
-    return characteristic.COOL;
-  }
-  return characteristic.OFF;
+  return characteristic.HEAT;
 }
 
 function parseCharacteristicNumber(value: CharacteristicValue): number | undefined {

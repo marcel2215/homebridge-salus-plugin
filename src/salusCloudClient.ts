@@ -2,6 +2,7 @@
 
 import type { Logging } from 'homebridge';
 import process from 'node:process';
+import crypto from 'node:crypto';
 
 import { baseNameForProperty, normalizeModelName, parseBooleanLike, parseNumberLike } from './propertyUtils.js';
 import type {
@@ -33,12 +34,30 @@ interface CognitoSession {
   tokenType: string;
   expiresAtEpochMs: number;
   companyCode?: string;
+  cognitoRegion?: string;
+  userPoolId?: string;
 }
 
 interface LegacySession {
   accessToken: string;
   tokenType: string;
   expiresAtEpochMs: number;
+}
+
+interface AwsIotCredentials {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken: string;
+  expiresAtEpochMs: number;
+}
+
+interface AwsRegionalDefaults {
+  cognitoRegion: string;
+  cognitoClientId: string;
+  cognitoUserPoolId: string;
+  awsIdentityPoolId: string;
+  awsIotRegion: string;
+  awsIotEndpointHost: string;
 }
 
 interface ShadowRequestVariant {
@@ -91,6 +110,10 @@ const MAX_RETRY_DELAY_MS = 60_000;
 const MAX_PREFERRED_WRITE_CACHE_SIZE = 2_000;
 const DEFAULT_COGNITO_REGION = 'eu-central-1';
 const DEFAULT_COGNITO_CLIENT_ID = '4pk5efh3v84g5dav43imsv4fbj';
+const DEFAULT_COGNITO_USER_POOL_ID = 'eu-central-1_XGRz3CgoY';
+const DEFAULT_US_COGNITO_REGION = 'us-west-2';
+const DEFAULT_US_COGNITO_CLIENT_ID = '1fgea5eabr72n1ueg16314jcqh';
+const DEFAULT_US_COGNITO_USER_POOL_ID = 'us-west-2_lb5ZECtRi';
 const DEFAULT_EU_SERVICE_API_HOST = 'https://service-api.eu.premium.salusconnect.io';
 const DEFAULT_US_SERVICE_API_HOST = 'https://service-api.us.premium.salusconnect.io';
 const FALLBACK_US_SERVICE_API_HOST = 'https://service-api.us.salusconnect.io';
@@ -99,12 +122,20 @@ const DEFAULT_EU_LEGACY_API_HOST = 'https://eu.premium.salusconnect.io';
 const DEFAULT_US_LEGACY_API_HOST = 'https://us.premium.salusconnect.io';
 const FALLBACK_US_LEGACY_API_HOST = 'https://us.salusconnect.io';
 const FALLBACK_EU_LEGACY_API_HOST = 'https://eu.salusconnect.io';
+const DEFAULT_EU_AWS_IDENTITY_POOL_ID = 'eu-central-1:60912c00-287d-413b-a2c9-ece3ccef9230';
+const DEFAULT_US_AWS_IDENTITY_POOL_ID = 'us-west-2:975c9020-1457-496c-a1df-d25bfae18016';
+const DEFAULT_EU_AWS_IOT_ENDPOINT_HOST = 'a24u3z7zzwrtdl-ats.iot.eu-central-1.amazonaws.com';
+const DEFAULT_US_AWS_IOT_ENDPOINT_HOST = 'a13wqb1xlbpvq5-ats.iot.us-west-2.amazonaws.com';
+const DEFAULT_AWS_IOT_SERVICE = 'iotdevicegateway';
+const COGNITO_IDENTITY_GET_ID_TARGET = 'AWSCognitoIdentityService.GetId';
+const COGNITO_IDENTITY_GET_CREDENTIALS_TARGET = 'AWSCognitoIdentityService.GetCredentialsForIdentity';
 
 const COGNITO_INITIATE_AUTH_TARGET = 'AWSCognitoIdentityProviderService.InitiateAuth';
 const ACCEPT_LANGUAGE = 'en-US,en;q=0.9,en;q=0.8';
 const SESSION_REFRESH_SAFETY_MS = 60_000;
 const LEGACY_SESSION_REFRESH_SAFETY_MS = 60_000;
 const LEGACY_DEFAULT_SESSION_TTL_MS = 45 * 60_000;
+const AWS_IOT_CREDENTIAL_REFRESH_SAFETY_MS = 60_000;
 const MAX_UNAUTHORIZED_RECOVERY_STEPS = 48;
 const SLIDER_DETAILS_BLOCK_TTL_MS = 15 * 60_000;
 const DEVICE_SHADOW_BLOCK_TTL_MS = 15 * 60_000;
@@ -244,6 +275,13 @@ export class SalusCloudClient {
   private readonly legacyApiBaseCandidates: string[];
   private readonly cognitoEndpoint: string;
   private readonly cognitoClientId: string;
+  private readonly configuredCognitoRegion: string;
+  private readonly configuredCognitoUserPoolId: string;
+  private readonly awsIdentityPoolId: string;
+  private readonly awsIotEndpointBaseUrl: string;
+  private readonly awsIotEndpointHost: string;
+  private readonly awsIotRegion: string;
+  private readonly awsIotServiceName: string;
   private readonly configuredCompanyCode: string | null;
   private companyCodeCandidates: CompanyCodeCandidate[] = [];
   private activeCompanyCode: CompanyCodeCandidate = null;
@@ -257,6 +295,9 @@ export class SalusCloudClient {
   private readonly propertyCacheByDsn: Map<string, SalusPropertyMap> = new Map();
   private readonly deviceIdToDsn: Map<string, string> = new Map();
   private readonly deviceKeyToDsn: Map<string, string> = new Map();
+  private readonly shadowBaseKeyByDsn: Map<string, string> = new Map();
+  private awsIdentityId: string | null = null;
+  private awsIotCredentials: AwsIotCredentials | null = null;
   private readonly blockedSliderDetailsTargets = new Map<string, number>();
   private blockedAllSliderDetailsUntilEpochMs = 0;
   private blockedModernDeviceShadowUntilEpochMs = 0;
@@ -293,9 +334,16 @@ export class SalusCloudClient {
       config.apiHost,
     );
 
-    const cognitoRegion = normalizeNonEmptyString(config.cognitoRegion) ?? DEFAULT_COGNITO_REGION;
-    this.cognitoClientId = normalizeNonEmptyString(config.cognitoClientId) ?? DEFAULT_COGNITO_CLIENT_ID;
-    this.cognitoEndpoint = `https://cognito-idp.${cognitoRegion}.amazonaws.com/`;
+    const defaults = getRegionalAwsDefaults(config.region);
+    this.configuredCognitoRegion = normalizeNonEmptyString(config.cognitoRegion) ?? defaults.cognitoRegion;
+    this.cognitoClientId = normalizeNonEmptyString(config.cognitoClientId) ?? defaults.cognitoClientId;
+    this.configuredCognitoUserPoolId = normalizeNonEmptyString(config.cognitoUserPoolId) ?? defaults.cognitoUserPoolId;
+    this.cognitoEndpoint = `https://cognito-idp.${this.configuredCognitoRegion}.amazonaws.com/`;
+    this.awsIdentityPoolId = normalizeNonEmptyString(config.awsIdentityPoolId) ?? defaults.awsIdentityPoolId;
+    this.awsIotRegion = normalizeNonEmptyString(config.awsIotRegion) ?? defaults.awsIotRegion;
+    this.awsIotServiceName = normalizeNonEmptyString(config.awsIotServiceName) ?? DEFAULT_AWS_IOT_SERVICE;
+    this.awsIotEndpointHost = normalizeAwsIotEndpointHost(config.awsIotEndpointHost ?? defaults.awsIotEndpointHost);
+    this.awsIotEndpointBaseUrl = `https://${this.awsIotEndpointHost}`;
     this.configuredCompanyCode = normalizeNonEmptyString(config.companyCode) ?? null;
     this.refreshCompanyCodeCandidates();
 
@@ -306,6 +354,9 @@ export class SalusCloudClient {
       this.log.debug(`Salus service-api candidates: ${this.serviceApiBaseCandidates.join(', ')}`);
       this.log.debug(`Salus legacy-api candidates: ${this.legacyApiBaseCandidates.join(', ')}`);
       this.log.debug(`Salus Cognito endpoint: ${this.cognitoEndpoint}`);
+      this.log.debug(`Salus Cognito user-pool id: ${this.configuredCognitoUserPoolId}`);
+      this.log.debug(`Salus AWS identity-pool id: ${this.awsIdentityPoolId}`);
+      this.log.debug(`Salus AWS IoT endpoint: ${this.awsIotEndpointBaseUrl} (${this.awsIotServiceName})`);
       this.log.debug(`Salus company-code candidates: ${this.companyCodeCandidates.map((candidate) => candidate ?? '<none>').join(', ')}`);
     }
   }
@@ -900,9 +951,29 @@ export class SalusCloudClient {
 
   private async setDatapointModern(dsn: string, propertyName: string, value: unknown): Promise<void> {
     const writeCacheKey = `${dsn}:${propertyName}`;
+    const iotAttemptDescription = 'AWS IoT thing shadow update';
+    const failures: string[] = [];
+
+    try {
+      await this.setDatapointViaAwsIotShadow(dsn, propertyName, value);
+      this.updateCachedProperty(dsn, propertyName, value);
+      this.rememberPreferredWriteAttempt(writeCacheKey, iotAttemptDescription);
+      if (this.verboseLogging) {
+        this.log.debug(`Write succeeded via ${iotAttemptDescription}`);
+      }
+      return;
+    } catch (error) {
+      const failureMessage = error instanceof HttpStatusError
+        ? `${iotAttemptDescription} -> HTTP ${error.status}`
+        : `${iotAttemptDescription} -> ${asErrorMessage(error)}`;
+      failures.push(failureMessage);
+      if (this.verboseLogging) {
+        this.log.debug(`AWS IoT write failed for ${dsn}/${propertyName}: ${asErrorMessage(error)}. Falling back to service-api write probes.`);
+      }
+    }
+
     const preferredAttempt = this.preferredWriteAttemptByKey.get(writeCacheKey) ?? null;
     const attempts = prioritizeByDescription(this.buildWriteAttempts(dsn, propertyName, value), preferredAttempt);
-    const failures: string[] = [];
     let fatalError: unknown;
 
     for (const attempt of attempts) {
@@ -947,6 +1018,332 @@ export class SalusCloudClient {
       );
     }
     throw new Error(`Failed to write property ${propertyName} on ${dsn}. Attempts: ${failures.join(' | ')}`);
+  }
+
+  private async setDatapointViaAwsIotShadow(dsn: string, propertyName: string, value: unknown): Promise<void> {
+    const shadowBaseKey = await this.resolveShadowBaseKeyForWrite(dsn, propertyName);
+    const payload = {
+      state: {
+        desired: {
+          [shadowBaseKey]: {
+            properties: {
+              [propertyName]: value,
+            },
+          },
+        },
+      },
+    };
+
+    await this.requestAwsIotShadowUpdate(dsn, payload);
+  }
+
+  private async resolveShadowBaseKeyForWrite(dsn: string, propertyName: string): Promise<string> {
+    const cached = this.shadowBaseKeyByDsn.get(dsn);
+    if (cached) {
+      return cached;
+    }
+
+    try {
+      const payload = await this.requestServiceJson('/devices/device_shadows', {
+        method: 'POST',
+        body: { device_codes: [dsn] },
+        auth: true,
+        activeServiceBaseOnly: true,
+      });
+      this.updateShadowBaseKeyCache(payload, propertyName);
+    } catch (error) {
+      if (this.verboseLogging) {
+        this.log.debug(`Unable to resolve shadow base key via /devices/device_shadows for ${dsn}: ${asErrorMessage(error)}`);
+      }
+    }
+
+    const resolved = this.shadowBaseKeyByDsn.get(dsn) ?? '11';
+    this.shadowBaseKeyByDsn.set(dsn, resolved);
+    return resolved;
+  }
+
+  private updateShadowBaseKeyCache(payload: unknown, propertyNameHint?: string): void {
+    const mappings = parseDeviceShadowBaseKeys(payload, this.deviceIdToDsn, this.deviceKeyToDsn, propertyNameHint);
+    for (const [dsn, baseKey] of mappings) {
+      this.shadowBaseKeyByDsn.set(dsn, baseKey);
+    }
+  }
+
+  private async ensureAwsIotCredentials(forceRefresh = false): Promise<AwsIotCredentials> {
+    if (!forceRefresh && this.awsIotCredentials && Date.now() + AWS_IOT_CREDENTIAL_REFRESH_SAFETY_MS < this.awsIotCredentials.expiresAtEpochMs) {
+      return this.awsIotCredentials;
+    }
+
+    await this.ensureLoggedIn();
+    if (!this.session) {
+      throw new Error('Missing Salus session while requesting AWS IoT credentials.');
+    }
+
+    const cognitoRegion = this.session.cognitoRegion ?? this.configuredCognitoRegion;
+    const userPoolId = this.session.userPoolId ?? this.configuredCognitoUserPoolId;
+    if (!cognitoRegion || !userPoolId) {
+      throw new Error('Unable to resolve Cognito provider information required for AWS IoT writes.');
+    }
+    const identityRegion = parseIdentityPoolRegion(this.awsIdentityPoolId) ?? cognitoRegion;
+    const provider = `cognito-idp.${cognitoRegion}.amazonaws.com/${userPoolId}`;
+    const idToken = this.session.idToken;
+
+    const resolveIdentityId = async (): Promise<string> => {
+      const identityPayload = await this.requestCognitoIdentityJson(identityRegion, COGNITO_IDENTITY_GET_ID_TARGET, {
+        IdentityPoolId: this.awsIdentityPoolId,
+        Logins: {
+          [provider]: idToken,
+        },
+      });
+      const identityRecord = asRecord(identityPayload);
+      const identityId = normalizeNonEmptyString(asString(identityRecord?.IdentityId));
+      if (!identityId) {
+        throw new Error('Cognito Identity GetId did not return IdentityId.');
+      }
+      return identityId;
+    };
+
+    const identityId = forceRefresh || !this.awsIdentityId
+      ? await resolveIdentityId()
+      : this.awsIdentityId;
+    this.awsIdentityId = identityId;
+
+    let credentialsPayload = await this.requestCognitoIdentityJson(identityRegion, COGNITO_IDENTITY_GET_CREDENTIALS_TARGET, {
+      IdentityId: identityId,
+      Logins: {
+        [provider]: idToken,
+      },
+    });
+    let credentials = parseAwsIotCredentials(credentialsPayload);
+
+    if (!credentials && !forceRefresh) {
+      this.awsIdentityId = await resolveIdentityId();
+      credentialsPayload = await this.requestCognitoIdentityJson(identityRegion, COGNITO_IDENTITY_GET_CREDENTIALS_TARGET, {
+        IdentityId: this.awsIdentityId,
+        Logins: {
+          [provider]: idToken,
+        },
+      });
+      credentials = parseAwsIotCredentials(credentialsPayload);
+    }
+
+    if (!credentials) {
+      throw new Error('Cognito Identity GetCredentialsForIdentity did not return temporary AWS credentials.');
+    }
+
+    this.awsIotCredentials = credentials;
+    return credentials;
+  }
+
+  private async requestCognitoIdentityJson(
+    identityRegion: string,
+    target: string,
+    body: Record<string, unknown>,
+  ): Promise<unknown> {
+    const endpoint = `https://cognito-identity.${identityRegion}.amazonaws.com/`;
+    const totalAttempts = this.maxRetries + 1;
+    let lastError: unknown = new Error(`No Cognito Identity response received for ${target}`);
+
+    for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+      try {
+        const response = await this.fetchWithTimeout(endpoint, {
+          method: 'POST',
+          headers: {
+            Accept: 'application/x-amz-json-1.1',
+            'Content-Type': 'application/x-amz-json-1.1',
+            'X-Amz-Target': target,
+          },
+          body: JSON.stringify(body),
+        });
+
+        if (!response.ok) {
+          const responseText = await safeReadText(response);
+          const error = new HttpStatusError(
+            responseText
+              ? `Cognito Identity ${target} failed (HTTP ${response.status}) :: ${responseText}`
+              : `Cognito Identity ${target} failed (HTTP ${response.status})`,
+            response.status,
+            responseText,
+          );
+          if (isRetriableStatus(response.status) && attempt < totalAttempts) {
+            lastError = error;
+            await this.retryDelay(attempt, error.message);
+            continue;
+          }
+          throw error;
+        }
+
+        return await response.json() as unknown;
+      } catch (error) {
+        if (!this.allowInsecureTls && isTlsCertificateError(error)) {
+          const message = `${asErrorMessage(error)}. If Salus cloud certificate is invalid, set "allowInsecureTls": true in plugin config.`;
+          throw new Error(message);
+        }
+        if (isRetriableFailure(error) && attempt < totalAttempts) {
+          lastError = error;
+          await this.retryDelay(attempt, asErrorMessage(error));
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    throw new Error(`Cognito Identity ${target} failed after retries: ${asErrorMessage(lastError)}`);
+  }
+
+  private async requestAwsIotShadowUpdate(dsn: string, payload: Record<string, unknown>): Promise<void> {
+    const payloadText = JSON.stringify(payload);
+    const thingShadowPath = `/things/${encodeURIComponent(dsn)}/shadow`;
+    const expectedStatuses = DEFAULT_EXPECTED_STATUSES;
+    const totalAttempts = this.maxRetries + 1;
+    const serviceCandidates = dedupeStringArray([this.awsIotServiceName, 'iotdata']);
+    let lastError: unknown = new Error(`No AWS IoT response received for ${dsn}`);
+    let hasRefreshedCredentialsAfterUnauthorized = false;
+
+    for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+      let sawRetriableFailure = false;
+      let lastRetriableError: unknown;
+      const credentials = await this.ensureAwsIotCredentials(hasRefreshedCredentialsAfterUnauthorized);
+
+      for (let serviceIndex = 0; serviceIndex < serviceCandidates.length; serviceIndex++) {
+        const serviceName = serviceCandidates[serviceIndex]!;
+        try {
+          const headers = this.buildAwsIotSigV4Headers(
+            'POST',
+            thingShadowPath,
+            payloadText,
+            serviceName,
+            credentials,
+          );
+          const response = await this.fetchWithTimeout(`${this.awsIotEndpointBaseUrl}${thingShadowPath}`, {
+            method: 'POST',
+            headers,
+            body: payloadText,
+          });
+
+          if (expectedStatuses.includes(response.status)) {
+            if (this.verboseLogging) {
+              this.log.debug(`AWS IoT shadow update succeeded for ${dsn} via service=${serviceName}`);
+            }
+            return;
+          }
+
+          const responseText = await safeReadText(response);
+          const statusError = new HttpStatusError(
+            responseText
+              ? `AWS IoT shadow update failed (HTTP ${response.status}) via service=${serviceName} on ${thingShadowPath} :: ${responseText}`
+              : `AWS IoT shadow update failed (HTTP ${response.status}) via service=${serviceName} on ${thingShadowPath}`,
+            response.status,
+            responseText,
+          );
+          lastError = statusError;
+
+          if ((response.status === 400 || response.status === 403) && serviceIndex < serviceCandidates.length - 1) {
+            if (this.verboseLogging) {
+              this.log.debug(
+                `AWS IoT write rejected via service=${serviceName} (HTTP ${response.status}); trying next signing service candidate.`,
+              );
+            }
+            continue;
+          }
+
+          if ((response.status === 401 || response.status === 403) && !hasRefreshedCredentialsAfterUnauthorized) {
+            hasRefreshedCredentialsAfterUnauthorized = true;
+            this.awsIotCredentials = null;
+            this.awsIdentityId = null;
+            sawRetriableFailure = true;
+            lastRetriableError = statusError;
+            break;
+          }
+
+          if (isRetriableStatus(response.status)) {
+            sawRetriableFailure = true;
+            lastRetriableError = statusError;
+            break;
+          }
+
+          throw statusError;
+        } catch (error) {
+          if (!this.allowInsecureTls && isTlsCertificateError(error)) {
+            const message = `${asErrorMessage(error)}. If Salus cloud certificate is invalid, set "allowInsecureTls": true in plugin config.`;
+            throw new Error(message);
+          }
+
+          if (isRetriableFailure(error)) {
+            lastError = error;
+            sawRetriableFailure = true;
+            lastRetriableError = error;
+            break;
+          }
+
+          throw error;
+        }
+      }
+
+      if (attempt < totalAttempts && sawRetriableFailure) {
+        await this.retryDelay(attempt, asErrorMessage(lastRetriableError ?? lastError));
+        continue;
+      }
+
+      if (lastError) {
+        throw lastError;
+      }
+    }
+
+    throw new Error(`AWS IoT shadow update exhausted retries for ${dsn}: ${asErrorMessage(lastError)}`);
+  }
+
+  private buildAwsIotSigV4Headers(
+    method: HttpMethod,
+    path: string,
+    payload: string,
+    serviceName: string,
+    credentials: AwsIotCredentials,
+  ): Record<string, string> {
+    const now = new Date();
+    const amzDate = formatAwsAmzDate(now);
+    const dateStamp = formatAwsDateStamp(now);
+    const payloadHash = sha256Hex(payload);
+    const host = this.awsIotEndpointHost;
+
+    const canonicalHeaders = [
+      ['content-type', 'application/json'],
+      ['host', host],
+      ['x-amz-content-sha256', payloadHash],
+      ['x-amz-date', amzDate],
+      ['x-amz-security-token', credentials.sessionToken],
+    ] as const;
+    const signedHeaders = canonicalHeaders.map(([name]) => name).join(';');
+    const canonicalRequest = [
+      method,
+      path,
+      '',
+      canonicalHeaders.map(([name, value]) => `${name}:${value}`).join('\n') + '\n',
+      signedHeaders,
+      payloadHash,
+    ].join('\n');
+
+    const credentialScope = `${dateStamp}/${this.awsIotRegion}/${serviceName}/aws4_request`;
+    const stringToSign = [
+      'AWS4-HMAC-SHA256',
+      amzDate,
+      credentialScope,
+      sha256Hex(canonicalRequest),
+    ].join('\n');
+    const signingKey = deriveAwsSigningKey(credentials.secretAccessKey, dateStamp, this.awsIotRegion, serviceName);
+    const signature = hmacSha256Hex(signingKey, stringToSign);
+
+    return {
+      'content-type': 'application/json',
+      'x-amz-content-sha256': payloadHash,
+      'x-amz-date': amzDate,
+      'x-amz-security-token': credentials.sessionToken,
+      Authorization: [
+        `AWS4-HMAC-SHA256 Credential=${credentials.accessKeyId}/${credentialScope}`,
+        `SignedHeaders=${signedHeaders}`,
+        `Signature=${signature}`,
+      ].join(', '),
+    };
   }
 
   private async setDatapointLegacy(dsn: string, propertyName: string, value: unknown): Promise<void> {
@@ -1339,6 +1736,7 @@ export class SalusCloudClient {
           },
         );
 
+        this.updateShadowBaseKeyCache(payload);
         const map = parseDeviceShadows(payload, this.deviceIdToDsn, this.deviceKeyToDsn);
         if (map.size > 0) {
           this.preferredShadowVariantDescription = variant.description;
@@ -2581,6 +2979,28 @@ function buildLegacyApiBaseCandidates(
   return dedupeStringArray(hosts.map((value) => normalizeUrl(value)));
 }
 
+function getRegionalAwsDefaults(region: SalusRegion | undefined): AwsRegionalDefaults {
+  if (region === 'us') {
+    return {
+      cognitoRegion: DEFAULT_US_COGNITO_REGION,
+      cognitoClientId: DEFAULT_US_COGNITO_CLIENT_ID,
+      cognitoUserPoolId: DEFAULT_US_COGNITO_USER_POOL_ID,
+      awsIdentityPoolId: DEFAULT_US_AWS_IDENTITY_POOL_ID,
+      awsIotRegion: parseIdentityPoolRegion(DEFAULT_US_AWS_IDENTITY_POOL_ID) ?? DEFAULT_US_COGNITO_REGION,
+      awsIotEndpointHost: DEFAULT_US_AWS_IOT_ENDPOINT_HOST,
+    };
+  }
+
+  return {
+    cognitoRegion: DEFAULT_COGNITO_REGION,
+    cognitoClientId: DEFAULT_COGNITO_CLIENT_ID,
+    cognitoUserPoolId: DEFAULT_COGNITO_USER_POOL_ID,
+    awsIdentityPoolId: DEFAULT_EU_AWS_IDENTITY_POOL_ID,
+    awsIotRegion: parseIdentityPoolRegion(DEFAULT_EU_AWS_IDENTITY_POOL_ID) ?? DEFAULT_COGNITO_REGION,
+    awsIotEndpointHost: DEFAULT_EU_AWS_IOT_ENDPOINT_HOST,
+  };
+}
+
 function deriveLegacyHostCandidatesFromOverride(overrideHost: string): string[] {
   const normalizedOverride = normalizeUrl(overrideHost);
   const candidates = new Set<string>();
@@ -2656,6 +3076,150 @@ function normalizeUrl(raw: string): string {
     return trimmed;
   }
   return `https://${trimmed}`;
+}
+
+function normalizeAwsIotEndpointHost(raw: string): string {
+  const normalized = normalizeNonEmptyString(raw);
+  if (!normalized) {
+    return DEFAULT_EU_AWS_IOT_ENDPOINT_HOST;
+  }
+
+  try {
+    const withScheme = /^https?:\/\//i.test(normalized) ? normalized : `https://${normalized}`;
+    return new URL(withScheme).hostname.trim().toLowerCase();
+  } catch {
+    const fallback = normalized
+      .replace(/^https?:\/\//i, '')
+      .split('/')[0]
+      ?.trim()
+      .toLowerCase();
+    return fallback || DEFAULT_EU_AWS_IOT_ENDPOINT_HOST;
+  }
+}
+
+function parseIdentityPoolRegion(identityPoolId: string | undefined): string | undefined {
+  const normalized = normalizeNonEmptyString(identityPoolId);
+  if (!normalized) {
+    return undefined;
+  }
+
+  const separatorIndex = normalized.indexOf(':');
+  if (separatorIndex <= 0) {
+    return undefined;
+  }
+
+  const region = normalized.slice(0, separatorIndex).trim();
+  if (!region || !/^[a-z]{2}-[a-z]+-\d+$/i.test(region)) {
+    return undefined;
+  }
+  return region;
+}
+
+function parseAwsIotCredentials(payload: unknown): AwsIotCredentials | undefined {
+  const root = asRecord(payload);
+  const credentialsRecord = asRecord(root?.Credentials) ?? asRecord(root?.credentials);
+  if (!credentialsRecord) {
+    return undefined;
+  }
+
+  const accessKeyId = normalizeNonEmptyString(asString(credentialsRecord.AccessKeyId) ?? asString(credentialsRecord.accessKeyId));
+  const secretAccessKey = normalizeNonEmptyString(
+    asString(credentialsRecord.SecretKey)
+    ?? asString(credentialsRecord.SecretAccessKey)
+    ?? asString(credentialsRecord.secretAccessKey),
+  );
+  const sessionToken = normalizeNonEmptyString(asString(credentialsRecord.SessionToken) ?? asString(credentialsRecord.sessionToken));
+
+  if (!accessKeyId || !secretAccessKey || !sessionToken) {
+    return undefined;
+  }
+
+  const expirationRaw = credentialsRecord.Expiration
+    ?? credentialsRecord.expiration
+    ?? credentialsRecord.ExpiresAt
+    ?? credentialsRecord.expiresAt;
+  const expiresAtEpochMs = parseAwsCredentialExpiryEpochMs(expirationRaw);
+
+  return {
+    accessKeyId,
+    secretAccessKey,
+    sessionToken,
+    expiresAtEpochMs,
+  };
+}
+
+function parseAwsCredentialExpiryEpochMs(value: unknown): number {
+  const now = Date.now();
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    if (value > 1_000_000_000_000) {
+      return value;
+    }
+    if (value > 1_000_000_000) {
+      return Math.floor(value * 1_000);
+    }
+    if (value > 0) {
+      return now + Math.floor(value * 1_000);
+    }
+  }
+
+  if (typeof value === 'string') {
+    const fromNumeric = Number(value);
+    if (Number.isFinite(fromNumeric)) {
+      return parseAwsCredentialExpiryEpochMs(fromNumeric);
+    }
+
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  if (value instanceof Date && Number.isFinite(value.getTime())) {
+    return value.getTime();
+  }
+
+  return now + (60 * 60_000);
+}
+
+function formatAwsAmzDate(now: Date): string {
+  return [
+    now.getUTCFullYear().toString().padStart(4, '0'),
+    (now.getUTCMonth() + 1).toString().padStart(2, '0'),
+    now.getUTCDate().toString().padStart(2, '0'),
+    'T',
+    now.getUTCHours().toString().padStart(2, '0'),
+    now.getUTCMinutes().toString().padStart(2, '0'),
+    now.getUTCSeconds().toString().padStart(2, '0'),
+    'Z',
+  ].join('');
+}
+
+function formatAwsDateStamp(now: Date): string {
+  return [
+    now.getUTCFullYear().toString().padStart(4, '0'),
+    (now.getUTCMonth() + 1).toString().padStart(2, '0'),
+    now.getUTCDate().toString().padStart(2, '0'),
+  ].join('');
+}
+
+function sha256Hex(value: string | Buffer): string {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function hmacSha256Buffer(key: string | Buffer, value: string | Buffer): Buffer {
+  return crypto.createHmac('sha256', key).update(value).digest();
+}
+
+function hmacSha256Hex(key: string | Buffer, value: string | Buffer): string {
+  return crypto.createHmac('sha256', key).update(value).digest('hex');
+}
+
+function deriveAwsSigningKey(secretAccessKey: string, dateStamp: string, region: string, serviceName: string): Buffer {
+  const kDate = hmacSha256Buffer(`AWS4${secretAccessKey}`, dateStamp);
+  const kRegion = hmacSha256Buffer(kDate, region);
+  const kService = hmacSha256Buffer(kRegion, serviceName);
+  return hmacSha256Buffer(kService, 'aws4_request');
 }
 
 function normalizeNonEmptyString(value: string | undefined): string | undefined {
@@ -2792,6 +3356,7 @@ function parseCognitoTokens(payload: unknown, refreshTokenFallback?: string): Co
   const tokenType = asString(authResult.TokenType) ?? 'Bearer';
   const decodedIdTokenClaims = decodeJwtPayload(idToken);
   const decodedAccessTokenClaims = decodeJwtPayload(accessToken);
+  const issuerDetails = parseCognitoIssuerDetails(decodedIdTokenClaims, decodedAccessTokenClaims);
 
   const expiresInRaw = parseNumberLike(authResult.ExpiresIn);
   const expiresInSeconds = expiresInRaw && Number.isFinite(expiresInRaw) ? Math.max(60, Math.floor(expiresInRaw)) : 3600;
@@ -2807,6 +3372,8 @@ function parseCognitoTokens(payload: unknown, refreshTokenFallback?: string): Co
     tokenType,
     expiresAtEpochMs: Date.now() + (expiresInSeconds * 1_000),
     companyCode: extractCompanyCodeFromTokenClaims(decodedIdTokenClaims, decodedAccessTokenClaims),
+    cognitoRegion: issuerDetails?.region,
+    userPoolId: issuerDetails?.userPoolId,
   };
 }
 
@@ -2906,6 +3473,35 @@ function decodeJwtPayload(token: string | undefined): Record<string, unknown> | 
   } catch {
     return undefined;
   }
+}
+
+function parseCognitoIssuerDetails(
+  ...claimSets: Array<Record<string, unknown> | undefined>
+): { region: string; userPoolId: string } | undefined {
+  for (const claims of claimSets) {
+    if (!claims) {
+      continue;
+    }
+
+    const issuer = normalizeNonEmptyString(asString(claims.iss) ?? asString(claims.issuer));
+    if (!issuer) {
+      continue;
+    }
+
+    const normalizedIssuer = issuer.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+    const match = normalizedIssuer.match(/^cognito-idp\.([^.]+)\.amazonaws\.com\/(.+)$/i);
+    if (!match) {
+      continue;
+    }
+
+    const region = normalizeNonEmptyString(match[1]);
+    const userPoolId = normalizeNonEmptyString(match[2]);
+    if (region && userPoolId) {
+      return { region, userPoolId };
+    }
+  }
+
+  return undefined;
 }
 
 function parseCognitoErrorMessage(responseBody: string): string {
@@ -3373,6 +3969,164 @@ function recordHasStrongDeviceIdentity(record: Record<string, unknown>): boolean
   return strongHints.some((value) => normalizeNonEmptyString(asString(value)));
 }
 
+function parseDeviceShadowBaseKeys(
+  payload: unknown,
+  deviceIdToDsn: Map<string, string>,
+  deviceKeyToDsn: Map<string, string>,
+  propertyNameHint?: string,
+): Map<string, string> {
+  const output = new Map<string, string>();
+  const queue: unknown[] = [payload];
+  const visited = new Set<unknown>();
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (current === null || current === undefined) {
+      continue;
+    }
+
+    if (typeof current === 'string') {
+      const parsed = parseJsonRecord(current);
+      if (parsed) {
+        queue.push(parsed);
+      }
+      continue;
+    }
+
+    if (typeof current !== 'object') {
+      continue;
+    }
+    if (visited.has(current)) {
+      continue;
+    }
+    visited.add(current);
+
+    if (Array.isArray(current)) {
+      for (const entry of current) {
+        queue.push(entry);
+      }
+      continue;
+    }
+
+    const record = current as Record<string, unknown>;
+    const dsn = inferShadowDsn(record, deviceIdToDsn, deviceKeyToDsn);
+    if (dsn) {
+      const baseKey = inferShadowBaseKey(record, propertyNameHint);
+      if (baseKey) {
+        output.set(dsn, baseKey);
+      }
+    }
+
+    for (const value of Object.values(record)) {
+      if (value && typeof value === 'object') {
+        queue.push(value);
+      }
+      if (typeof value === 'string') {
+        const parsed = parseJsonRecord(value);
+        if (parsed) {
+          queue.push(parsed);
+        }
+      }
+    }
+  }
+
+  return output;
+}
+
+function inferShadowBaseKey(record: Record<string, unknown>, propertyNameHint?: string): string | undefined {
+  const containers: Array<Record<string, unknown> | undefined> = [
+    asRecord(record.desired),
+    asRecord(record.reported),
+    asRecord(record.state),
+    asRecord(asRecord(record.state)?.desired),
+    asRecord(asRecord(record.state)?.reported),
+    asRecord(asRecord(record.state)?.delta),
+    asRecord(record.shadow),
+    asRecord(record.device_shadow),
+    asRecord(record.payload),
+    asRecord(record.data),
+    asRecord(record.value),
+  ];
+
+  for (const container of containers) {
+    const resolved = inferShadowBaseKeyFromContainer(container, propertyNameHint);
+    if (resolved) {
+      return resolved;
+    }
+  }
+
+  return undefined;
+}
+
+function inferShadowBaseKeyFromContainer(
+  container: Record<string, unknown> | undefined,
+  propertyNameHint?: string,
+): string | undefined {
+  if (!container) {
+    return undefined;
+  }
+
+  const entries = Object.entries(container);
+  if (entries.length === 0) {
+    return undefined;
+  }
+
+  const withProperties: string[] = [];
+  const numericWithProperties: string[] = [];
+  for (const [key, rawValue] of entries) {
+    const valueRecord = asRecord(rawValue);
+    if (!valueRecord) {
+      continue;
+    }
+
+    const properties = extractShadowPropertiesContainer(valueRecord);
+    if (!properties) {
+      continue;
+    }
+
+    if (propertyNameHint && Object.prototype.hasOwnProperty.call(properties, propertyNameHint)) {
+      return key;
+    }
+
+    withProperties.push(key);
+    if (/^\d+$/.test(key)) {
+      numericWithProperties.push(key);
+    }
+  }
+
+  if (numericWithProperties.includes('11')) {
+    return '11';
+  }
+  if (numericWithProperties.length > 0) {
+    return numericWithProperties.sort((left, right) => Number(left) - Number(right))[0];
+  }
+  if (withProperties.length > 0) {
+    return withProperties[0];
+  }
+
+  return undefined;
+}
+
+function extractShadowPropertiesContainer(record: Record<string, unknown>): Record<string, unknown> | undefined {
+  const directProperties = asRecord(record.properties);
+  if (directProperties) {
+    return directProperties;
+  }
+
+  const nestedState = asRecord(record.state);
+  if (nestedState) {
+    const nestedProperties = asRecord(nestedState.properties)
+      ?? asRecord(asRecord(nestedState.reported)?.properties)
+      ?? asRecord(asRecord(nestedState.desired)?.properties)
+      ?? asRecord(asRecord(nestedState.delta)?.properties);
+    if (nestedProperties) {
+      return nestedProperties;
+    }
+  }
+
+  return undefined;
+}
+
 function parseDeviceShadows(
   payload: unknown,
   deviceIdToDsn: Map<string, string>,
@@ -3583,7 +4337,50 @@ function inferShadowDsn(
     }
   }
 
+  const fromThingName = parseDsnFromShadowThingName(record);
+  if (fromThingName) {
+    return fromThingName;
+  }
+
   return undefined;
+}
+
+function parseDsnFromShadowThingName(record: Record<string, unknown>): string | undefined {
+  const rawThingName = normalizeNonEmptyString(
+    asString(record.thing_name)
+    ?? asString(record.thingName)
+    ?? asString(record.thing)
+    ?? asString(record.topic)
+    ?? asString(record.shadow_topic),
+  );
+  if (!rawThingName) {
+    return undefined;
+  }
+
+  const match = rawThingName.match(/\/things\/([^/]+)\/shadow/i);
+  const candidate = match?.[1] ?? rawThingName;
+  const decoded = normalizeNonEmptyString(decodeURIComponentSafe(candidate));
+  if (!decoded) {
+    return undefined;
+  }
+
+  // Keep this guard permissive for future DSN formats while rejecting obvious non-device labels.
+  if (decoded.length < 6) {
+    return undefined;
+  }
+  if (decoded.includes('/') || decoded.includes(' ')) {
+    return undefined;
+  }
+
+  return decoded;
+}
+
+function decodeURIComponentSafe(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
 }
 
 function parseProperties(payload: unknown): SalusPropertyMap {

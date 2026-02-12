@@ -92,6 +92,27 @@
         "type": "string",
         "description": "Optional reference value for diagnostics only."
       },
+      "awsIdentityPoolId": {
+        "title": "Advanced: AWS Identity Pool ID",
+        "type": "string",
+        "description": "Cognito Identity pool used to exchange Salus Cognito ID token for temporary AWS IoT credentials."
+      },
+      "awsIotEndpointHost": {
+        "title": "Advanced: AWS IoT Endpoint Host",
+        "type": "string",
+        "description": "AWS IoT Data endpoint host (without path), for example a24u3z7zzwrtdl-ats.iot.eu-central-1.amazonaws.com."
+      },
+      "awsIotRegion": {
+        "title": "Advanced: AWS IoT Region",
+        "type": "string",
+        "description": "AWS region used for SigV4 signing of IoT thing-shadow updates."
+      },
+      "awsIotServiceName": {
+        "title": "Advanced: AWS IoT SigV4 Service Name",
+        "type": "string",
+        "default": "iotdevicegateway",
+        "description": "SigV4 service name for AWS IoT shadow writes. Keep default unless Salus changes signing requirements."
+      },
       "companyCode": {
         "title": "Advanced: Company Code Header",
         "type": "string",

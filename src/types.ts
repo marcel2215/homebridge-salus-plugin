@@ -14,6 +14,10 @@ export interface SalusPlatformConfig extends PlatformConfig {
   cognitoRegion?: string;
   cognitoClientId?: string;
   cognitoUserPoolId?: string;
+  awsIdentityPoolId?: string;
+  awsIotEndpointHost?: string;
+  awsIotRegion?: string;
+  awsIotServiceName?: string;
   companyCode?: string;
   pollIntervalSeconds?: number;
   requestTimeoutSeconds?: number;
