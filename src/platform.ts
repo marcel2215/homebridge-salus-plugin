@@ -783,31 +783,34 @@ function canonicalizeDsn(value: string): string {
 }
 
 function sanitizeHomeKitName(name: string, fallback: string): string {
-  const candidate = (name || fallback || '').trim();
-  const normalized = candidate
-    .normalize('NFKD')
-    .replaceAll(/[\u0300-\u036F]/g, '')
-    .replaceAll(/[^A-Za-z0-9' ]+/g, ' ')
+  const preferred = (name || fallback || 'Salus Device').trim();
+  const sanitized = stripControlCharacters(preferred)
     .replaceAll(/\s+/g, ' ')
     .trim();
-  const trimmedEdges = normalized
-    .replaceAll(/^[^A-Za-z0-9]+/g, '')
-    .replaceAll(/[^A-Za-z0-9]+$/g, '')
-    .trim();
-  if (trimmedEdges !== '') {
-    return trimmedEdges;
+  if (sanitized !== '') {
+    return sanitized;
   }
 
-  const fallbackNormalized = (fallback || 'Salus Device')
-    .normalize('NFKD')
-    .replaceAll(/[\u0300-\u036F]/g, '')
-    .replaceAll(/[^A-Za-z0-9' ]+/g, ' ')
+  const fallbackSanitized = stripControlCharacters(fallback || 'Salus Device')
     .replaceAll(/\s+/g, ' ')
     .trim();
-  if (fallbackNormalized !== '') {
-    return fallbackNormalized;
+  if (fallbackSanitized !== '') {
+    return fallbackSanitized;
   }
+
   return 'Salus Device';
+}
+
+function stripControlCharacters(value: string): string {
+  let output = '';
+  for (const char of value) {
+    const code = char.charCodeAt(0);
+    if ((code >= 0 && code <= 31) || code === 127) {
+      continue;
+    }
+    output += char;
+  }
+  return output;
 }
 
 function normalizeDeviceOnlineState(device: SalusDevice, properties: SalusPropertyMap): SalusDevice {
