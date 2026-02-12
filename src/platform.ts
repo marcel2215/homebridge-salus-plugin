@@ -389,7 +389,7 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
         .map((device) => ({ ...device, name: sanitizeHomeKitName(device.name, device.model || device.dsn) }));
       const uniqueDevices = dedupeDevicesByHomeKitUuid(this.api, dedupedByDsn, this.log);
       for (const device of uniqueDevices) {
-        discoveredUuids.add(this.api.hap.uuid.generate(`salus:${device.dsn}`));
+        discoveredUuids.add(this.api.hap.uuid.generate(`salus:${canonicalizeDsn(device.dsn)}`));
       }
 
       const deviceSnapshots = await mapWithConcurrency(
@@ -424,7 +424,7 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
           continue;
         }
         updatedDeviceCount++;
-        const uuid = this.api.hap.uuid.generate(`salus:${snapshot.device.dsn}`);
+        const uuid = this.api.hap.uuid.generate(`salus:${canonicalizeDsn(snapshot.device.dsn)}`);
         const existingAccessory = this.accessories.get(uuid);
         if (existingAccessory) {
           this.restoreOrUpdateAccessory(existingAccessory, snapshot.device, snapshot.profile, snapshot.properties);
@@ -542,9 +542,11 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
     };
     const contextChanged = !areContextDevicesEqual(context.device, nextContextDevice)
       || !areProfilesEquivalent(context.profile, profile);
-    if (contextChanged) {
-      context.device = nextContextDevice;
-      context.profile = profile;
+    if (contextChanged || needsNameUpdate) {
+      if (contextChanged) {
+        context.device = nextContextDevice;
+        context.profile = profile;
+      }
       this.api.updatePlatformAccessories([accessory]);
     }
 
@@ -727,7 +729,7 @@ function dedupeDevicesByDsn(devices: SalusDevice[]): SalusDevice[] {
 function dedupeDevicesByHomeKitUuid(api: API, devices: SalusDevice[], log: Logging): SalusDevice[] {
   const byUuid = new Map<string, SalusDevice>();
   for (const device of devices) {
-    const uuid = api.hap.uuid.generate(`salus:${device.dsn}`);
+    const uuid = api.hap.uuid.generate(`salus:${canonicalizeDsn(device.dsn)}`);
     const existing = byUuid.get(uuid);
     if (!existing) {
       byUuid.set(uuid, device);
