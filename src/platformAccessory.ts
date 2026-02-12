@@ -69,50 +69,6 @@ const THERMOSTAT_COOL_SETPOINT_COMMAND = [
   'SetTargetTemperature_x100',
   'SetTargetTemperature',
 ];
-const THERMOSTAT_HEAT_SETPOINT = [
-  'HeatingSetpoint_x100',
-  'SetHeatingSetpoint_x100',
-  'AutoHeatingSetpoint_x100',
-  'SetAutoHeatingSetpoint_x100',
-  'TargetTemperature_x100',
-  'SetTargetTemperature_x100',
-  'Setpoint_x100',
-  'HeatSetpoint_x100',
-  'OccupiedHeatingSetpoint_x100',
-  'CloudySetpoint_x100',
-  'HeatingSetpoint',
-  'SetHeatingSetpoint',
-  'AutoHeatingSetpoint',
-  'SetAutoHeatingSetpoint',
-  'TargetTemperature',
-  'SetTargetTemperature',
-  'Setpoint',
-  'HeatSetpoint',
-  'OccupiedHeatingSetpoint',
-  'CloudySetpoint',
-];
-const THERMOSTAT_COOL_SETPOINT = [
-  'CoolingSetpoint_x100',
-  'SetCoolingSetpoint_x100',
-  'AutoCoolingSetpoint_x100',
-  'SetAutoCoolingSetpoint_x100',
-  'TargetTemperature_x100',
-  'SetTargetTemperature_x100',
-  'Setpoint_x100',
-  'CoolSetpoint_x100',
-  'OccupiedCoolingSetpoint_x100',
-  'SunnySetpoint_x100',
-  'CoolingSetpoint',
-  'SetCoolingSetpoint',
-  'AutoCoolingSetpoint',
-  'SetAutoCoolingSetpoint',
-  'TargetTemperature',
-  'SetTargetTemperature',
-  'Setpoint',
-  'CoolSetpoint',
-  'OccupiedCoolingSetpoint',
-  'SunnySetpoint',
-];
 const THERMOSTAT_SYSTEM_MODE = ['SystemMode', 'SetSystemMode'];
 const THERMOSTAT_RUNNING_STATE = ['RunningState', 'RunningMode'];
 const THERMOSTAT_HOLD_TYPE = ['HoldType', 'SetHoldType'];
@@ -120,61 +76,61 @@ const THERMOSTAT_HUMIDITY = ['RelativeHumidity_x100', 'RelativeHumidity', 'Humid
 
 const WRITE_SYSTEM_MODE = ['SetSystemMode', 'SystemMode'];
 const WRITE_HEAT_SETPOINT = [
-  'HeatingSetpoint_x100',
   'SetHeatingSetpoint_x100',
   'SetTargetTemperature_x100',
+  'HeatingSetpoint_x100',
   'TargetTemperature_x100',
   'Setpoint_x100',
   'CloudySetpoint_x100',
+  'SetTargetTemperature',
   'SetHeatingSetpoint',
   'HeatingSetpoint',
-  'SetTargetTemperature',
   'TargetTemperature',
   'Setpoint',
   'CloudySetpoint',
 ];
 const WRITE_COOL_SETPOINT = [
-  'CoolingSetpoint_x100',
   'SetCoolingSetpoint_x100',
   'SetTargetTemperature_x100',
+  'CoolingSetpoint_x100',
   'TargetTemperature_x100',
   'Setpoint_x100',
   'SunnySetpoint_x100',
+  'SetTargetTemperature',
   'SetCoolingSetpoint',
   'CoolingSetpoint',
-  'SetTargetTemperature',
   'TargetTemperature',
   'Setpoint',
   'SunnySetpoint',
 ];
 const WRITE_AUTO_HEAT_SETPOINT = [
-  'HeatingSetpoint_x100',
   'SetAutoHeatingSetpoint_x100',
   'SetHeatingSetpoint_x100',
   'SetTargetTemperature_x100',
+  'HeatingSetpoint_x100',
   'TargetTemperature_x100',
   'Setpoint_x100',
   'CloudySetpoint_x100',
   'SetAutoHeatingSetpoint',
   'SetHeatingSetpoint',
-  'HeatingSetpoint',
   'SetTargetTemperature',
+  'HeatingSetpoint',
   'TargetTemperature',
   'Setpoint',
   'CloudySetpoint',
 ];
 const WRITE_AUTO_COOL_SETPOINT = [
-  'CoolingSetpoint_x100',
   'SetAutoCoolingSetpoint_x100',
   'SetCoolingSetpoint_x100',
   'SetTargetTemperature_x100',
+  'CoolingSetpoint_x100',
   'TargetTemperature_x100',
   'Setpoint_x100',
   'SunnySetpoint_x100',
   'SetAutoCoolingSetpoint',
   'SetCoolingSetpoint',
-  'CoolingSetpoint',
   'SetTargetTemperature',
+  'CoolingSetpoint',
   'TargetTemperature',
   'Setpoint',
   'SunnySetpoint',
@@ -509,12 +465,12 @@ export class SalusPlatformAccessory {
   private updateThermostatCharacteristics(): void {
     const currentTempRaw = getNumberProperty(this.latestProperties, THERMOSTAT_CURRENT_TEMP);
     const heatingSetpointRaw = this.resolveEffectiveThermostatSetpoint(
-      THERMOSTAT_HEAT_SETPOINT,
       THERMOSTAT_HEAT_SETPOINT_COMMAND,
+      THERMOSTAT_HEAT_SETPOINT_EFFECTIVE,
     );
     const coolingSetpointRaw = this.resolveEffectiveThermostatSetpoint(
-      THERMOSTAT_COOL_SETPOINT,
       THERMOSTAT_COOL_SETPOINT_COMMAND,
+      THERMOSTAT_COOL_SETPOINT_EFFECTIVE,
     );
     const systemModeRaw = getNumberProperty(this.latestProperties, THERMOSTAT_SYSTEM_MODE);
     const runningStateRaw = getNumberProperty(this.latestProperties, THERMOSTAT_RUNNING_STATE);
@@ -577,23 +533,11 @@ export class SalusPlatformAccessory {
     const primaryRaw = getNumberProperty(this.latestProperties, primaryCandidates);
     const commandRaw = getNumberProperty(this.latestProperties, commandCandidates);
 
-    if (primaryRaw === undefined) {
-      return commandRaw;
-    }
-    if (commandRaw === undefined) {
+    if (primaryRaw !== undefined) {
       return primaryRaw;
     }
 
-    const primaryC = normalizeTemperatureFromX100(primaryRaw);
-    const commandC = normalizeTemperatureFromX100(commandRaw);
-
-    // Some Salus tenants update command and effective setpoint fields asynchronously.
-    // Prefer command value when mismatch is meaningful to avoid stale HomeKit display.
-    if (Math.abs(primaryC - commandC) >= 0.4) {
-      return commandRaw;
-    }
-
-    return primaryRaw;
+    return commandRaw;
   }
 
   private updateSwitchCharacteristics(): void {
@@ -918,11 +862,9 @@ export class SalusPlatformAccessory {
           }
         }
 
-        if (primaryC !== undefined) {
-          if (Math.abs(primaryC - expectedTemperatureC) <= toleranceC) {
-            return;
-          }
-        } else if (commandC !== undefined && Math.abs(commandC - expectedTemperatureC) <= toleranceC) {
+        const primaryMatches = primaryC !== undefined && Math.abs(primaryC - expectedTemperatureC) <= toleranceC;
+        const commandMatches = commandC !== undefined && Math.abs(commandC - expectedTemperatureC) <= toleranceC;
+        if (primaryMatches || commandMatches) {
           return;
         }
       } catch (error) {

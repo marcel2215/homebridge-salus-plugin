@@ -74,6 +74,12 @@ interface WriteAttempt {
   description: string;
 }
 
+interface AwsShadowWriteContext {
+  branchKeys: string[];
+  includeRootProperties: boolean;
+  propertyNames: string[];
+}
+
 interface OccupantsSliderTarget {
   id: string;
   typeHints: string[];
@@ -1027,20 +1033,258 @@ export class SalusCloudClient {
   }
 
   private async setDatapointViaAwsIotShadow(dsn: string, propertyName: string, value: unknown): Promise<void> {
-    const shadowBaseKey = await this.resolveShadowBaseKeyForWrite(dsn, propertyName);
-    const payload = {
-      state: {
-        desired: {
-          [shadowBaseKey]: {
-            properties: {
-              [propertyName]: value,
-            },
-          },
-        },
-      },
+    const context = await this.resolveShadowWriteContextForDatapoint(dsn, propertyName);
+    const propertyUpdates = Object.fromEntries(context.propertyNames.map((name) => [name, value]));
+    const desired: Record<string, unknown> = {};
+
+    if (context.includeRootProperties) {
+      desired.properties = propertyUpdates;
+    }
+    for (const branchKey of context.branchKeys) {
+      desired[branchKey] = {
+        properties: propertyUpdates,
+      };
+    }
+
+    if (Object.keys(desired).length === 0) {
+      desired['11'] = {
+        properties: propertyUpdates,
+      };
+    }
+
+    if (this.verboseLogging) {
+      this.log.debug(
+        `AWS IoT write context for ${dsn}/${propertyName}: branches=[${context.branchKeys.join(', ')}], `
+        + `rootProperties=${context.includeRootProperties}, properties=[${context.propertyNames.join(', ')}]`,
+      );
+    }
+
+    await this.requestAwsIotShadowUpdate(dsn, { state: { desired } });
+  }
+
+  private async resolveShadowWriteContextForDatapoint(dsn: string, propertyName: string): Promise<AwsShadowWriteContext> {
+    const propertyNames = this.buildShadowPropertyWriteVariants(propertyName);
+    const branchKeys = new Set<string>();
+    let includeRootProperties = false;
+
+    const shortId = this.extractShadowShortIdFromDsn(dsn);
+    if (shortId) {
+      branchKeys.add(shortId);
+    }
+
+    const cachedBaseKey = this.shadowBaseKeyByDsn.get(dsn);
+    if (cachedBaseKey) {
+      branchKeys.add(cachedBaseKey);
+    }
+
+    try {
+      const payload = await this.requestServiceJson('/devices/device_shadows', {
+        method: 'POST',
+        body: { device_codes: [dsn] },
+        auth: true,
+        activeServiceBaseOnly: true,
+      });
+
+      this.updateShadowBaseKeyCache(payload, propertyName);
+
+      const discovered = this.discoverShadowWriteContextFromPayload(payload, dsn);
+      includeRootProperties = discovered.includeRootProperties;
+      for (const key of discovered.branchKeys) {
+        branchKeys.add(key);
+      }
+    } catch (error) {
+      if (this.verboseLogging) {
+        this.log.debug(`Unable to resolve shadow write context via /devices/device_shadows for ${dsn}: ${asErrorMessage(error)}`);
+      }
+    }
+
+    const resolvedBaseKey = this.shadowBaseKeyByDsn.get(dsn);
+    if (resolvedBaseKey) {
+      branchKeys.add(resolvedBaseKey);
+    }
+
+    if (branchKeys.size === 0 && !includeRootProperties) {
+      branchKeys.add('11');
+    }
+
+    return {
+      branchKeys: [...branchKeys],
+      includeRootProperties,
+      propertyNames,
+    };
+  }
+
+  private discoverShadowWriteContextFromPayload(
+    payload: unknown,
+    dsn: string,
+  ): { branchKeys: string[]; includeRootProperties: boolean } {
+    const branchKeys = new Set<string>();
+    const queue: unknown[] = [payload];
+    const visited = new Set<unknown>();
+    const matchedDesiredCandidates: Record<string, unknown>[] = [];
+    const genericDesiredCandidates: Record<string, unknown>[] = [];
+    let includeRootProperties = false;
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (current === undefined || current === null) {
+        continue;
+      }
+
+      if (typeof current === 'string') {
+        const parsed = parseJsonRecord(current);
+        if (parsed) {
+          queue.push(parsed);
+        }
+        continue;
+      }
+
+      if (typeof current !== 'object') {
+        continue;
+      }
+      if (visited.has(current)) {
+        continue;
+      }
+      visited.add(current);
+
+      if (Array.isArray(current)) {
+        for (const entry of current) {
+          queue.push(entry);
+        }
+        continue;
+      }
+
+      const record = current as Record<string, unknown>;
+      const desiredCandidates = this.extractShadowDesiredContainersFromRecord(record);
+      if (desiredCandidates.length > 0) {
+        const inferredDsn = inferShadowDsn(record, this.deviceIdToDsn, this.deviceKeyToDsn);
+        if (inferredDsn && inferredDsn === dsn) {
+          matchedDesiredCandidates.push(...desiredCandidates);
+        } else {
+          genericDesiredCandidates.push(...desiredCandidates);
+        }
+      }
+
+      for (const value of Object.values(record)) {
+        if (typeof value === 'string') {
+          const parsed = parseJsonRecord(value);
+          if (parsed) {
+            queue.push(parsed);
+          }
+          continue;
+        }
+        if (value && typeof value === 'object') {
+          queue.push(value);
+        }
+      }
+    }
+
+    const desiredCandidates = matchedDesiredCandidates.length > 0
+      ? matchedDesiredCandidates
+      : genericDesiredCandidates;
+
+    for (const desired of desiredCandidates) {
+      if (asRecord(desired.properties)) {
+        includeRootProperties = true;
+      }
+
+      for (const [key, rawValue] of Object.entries(desired)) {
+        const valueRecord = asRecord(rawValue);
+        if (!valueRecord) {
+          continue;
+        }
+
+        const properties = extractShadowPropertiesContainer(valueRecord);
+        if (!properties) {
+          continue;
+        }
+        branchKeys.add(key);
+      }
+    }
+
+    return {
+      branchKeys: [...branchKeys],
+      includeRootProperties,
+    };
+  }
+
+  private extractShadowDesiredContainersFromRecord(record: Record<string, unknown>): Record<string, unknown>[] {
+    const containers: Record<string, unknown>[] = [];
+    const addContainer = (candidate: unknown): void => {
+      const container = asRecord(candidate);
+      if (container) {
+        containers.push(container);
+      }
     };
 
-    await this.requestAwsIotShadowUpdate(dsn, payload);
+    addContainer(record.desired);
+
+    const stateRecord = asRecord(record.state);
+    if (stateRecord) {
+      addContainer(stateRecord.desired);
+    }
+
+    const shadowRecord = asRecord(record.shadow);
+    if (shadowRecord) {
+      addContainer(shadowRecord.desired);
+      const shadowState = asRecord(shadowRecord.state);
+      if (shadowState) {
+        addContainer(shadowState.desired);
+      }
+    } else if (typeof record.shadow === 'string') {
+      const parsedShadow = parseJsonRecord(record.shadow);
+      if (parsedShadow) {
+        addContainer(parsedShadow.desired);
+        const parsedState = asRecord(parsedShadow.state);
+        if (parsedState) {
+          addContainer(parsedState.desired);
+        }
+      }
+    }
+
+    const deviceShadowRecord = asRecord(record.device_shadow);
+    if (deviceShadowRecord) {
+      addContainer(deviceShadowRecord.desired);
+      const deviceShadowState = asRecord(deviceShadowRecord.state);
+      if (deviceShadowState) {
+        addContainer(deviceShadowState.desired);
+      }
+    } else if (typeof record.device_shadow === 'string') {
+      const parsedShadow = parseJsonRecord(record.device_shadow);
+      if (parsedShadow) {
+        addContainer(parsedShadow.desired);
+        const parsedState = asRecord(parsedShadow.state);
+        if (parsedState) {
+          addContainer(parsedState.desired);
+        }
+      }
+    }
+
+    return containers;
+  }
+
+  private buildShadowPropertyWriteVariants(propertyName: string): string[] {
+    const variants = new Set<string>([propertyName]);
+    const endpointMatch = propertyName.match(/^ep_?(\d+):(.*)$/);
+    if (endpointMatch) {
+      const endpoint = endpointMatch[1]!;
+      const remainder = endpointMatch[2]!;
+      variants.add(`ep${endpoint}:${remainder}`);
+      variants.add(`ep_${endpoint}:${remainder}`);
+    }
+    return [...variants];
+  }
+
+  private extractShadowShortIdFromDsn(dsn: string): string | undefined {
+    const segments = dsn.split('-');
+    const last = normalizeNonEmptyString(segments[segments.length - 1]);
+    if (!last) {
+      return undefined;
+    }
+    if (!/^[A-Za-z0-9_]{8,}$/.test(last)) {
+      return undefined;
+    }
+    return last.toLowerCase();
   }
 
   private async resolveShadowBaseKeyForWrite(dsn: string, propertyName: string): Promise<string> {
@@ -4184,6 +4428,20 @@ function parseDeviceShadows(
         mergePropertyMaps(merged, parsed);
       }
 
+      // Salus shadows can contain both desired and reported copies of the same
+      // datapoint. Keep desired-only command fields (e.g. Set* properties), but
+      // always let reported values win for overlapping keys so HomeKit reflects
+      // actual live device state.
+      const reportedCandidates = collectReportedShadowPropertyCandidates(record);
+      if (reportedCandidates.length > 0) {
+        const reportedProperties = new Map<string, SalusProperty>();
+        for (const candidate of reportedCandidates) {
+          const parsed = parseProperties(candidate);
+          mergePropertyMaps(reportedProperties, parsed);
+        }
+        mergePropertyMaps(merged, reportedProperties);
+      }
+
       if (merged.size === 0) {
         // Some payloads provide a flat object map directly on device record.
         const parsedFromRecord = parseProperties(record);
@@ -4208,6 +4466,160 @@ function parseDeviceShadows(
   }
 
   return output;
+}
+
+function collectReportedShadowPropertyCandidates(record: Record<string, unknown>): unknown[] {
+  const candidates: unknown[] = [];
+  const queue: unknown[] = [record];
+  const visited = new Set<unknown>();
+  const seenCandidates = new Set<unknown>();
+
+  const addCandidate = (candidate: unknown): void => {
+    if (!candidate || typeof candidate !== 'object') {
+      return;
+    }
+    if (seenCandidates.has(candidate)) {
+      return;
+    }
+    seenCandidates.add(candidate);
+    candidates.push(candidate);
+  };
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (current === undefined || current === null) {
+      continue;
+    }
+
+    if (typeof current === 'string') {
+      const parsed = parseJsonRecord(current);
+      if (parsed) {
+        queue.push(parsed);
+      }
+      continue;
+    }
+
+    if (typeof current !== 'object') {
+      continue;
+    }
+    if (visited.has(current)) {
+      continue;
+    }
+    visited.add(current);
+
+    if (Array.isArray(current)) {
+      for (const entry of current) {
+        queue.push(entry);
+      }
+      continue;
+    }
+
+    const currentRecord = current as Record<string, unknown>;
+    const stateRecord = asRecord(currentRecord.state);
+    const reportedLayers = [
+      asRecord(currentRecord.reported),
+      asRecord(stateRecord?.reported),
+    ]
+      .filter((value): value is Record<string, unknown> => Boolean(value));
+
+    for (const reportedLayer of reportedLayers) {
+      for (const candidate of collectLayerPropertyCandidates(reportedLayer)) {
+        addCandidate(candidate);
+      }
+    }
+
+    for (const value of Object.values(currentRecord)) {
+      if (typeof value === 'string') {
+        const parsed = parseJsonRecord(value);
+        if (parsed) {
+          queue.push(parsed);
+        }
+        continue;
+      }
+      if (value && typeof value === 'object') {
+        queue.push(value);
+      }
+    }
+  }
+
+  return candidates;
+}
+
+function collectLayerPropertyCandidates(layerRoot: Record<string, unknown>): unknown[] {
+  const candidates: unknown[] = [];
+  const queue: unknown[] = [layerRoot];
+  const visited = new Set<unknown>();
+  const seenCandidates = new Set<unknown>();
+
+  const addCandidate = (candidate: unknown): void => {
+    if (!candidate || typeof candidate !== 'object') {
+      return;
+    }
+    if (seenCandidates.has(candidate)) {
+      return;
+    }
+    seenCandidates.add(candidate);
+    candidates.push(candidate);
+  };
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (current === undefined || current === null) {
+      continue;
+    }
+
+    if (typeof current === 'string') {
+      const parsed = parseJsonRecord(current);
+      if (parsed) {
+        queue.push(parsed);
+      }
+      continue;
+    }
+
+    if (typeof current !== 'object') {
+      continue;
+    }
+    if (visited.has(current)) {
+      continue;
+    }
+    visited.add(current);
+
+    if (Array.isArray(current)) {
+      for (const entry of current) {
+        queue.push(entry);
+      }
+      continue;
+    }
+
+    const currentRecord = current as Record<string, unknown>;
+    addCandidate(currentRecord);
+
+    const propertyMaps = [
+      asRecord(currentRecord.properties),
+      asRecord(currentRecord.attrs),
+      asRecord(currentRecord.property_values),
+      asRecord(currentRecord.datapoints),
+    ]
+      .filter((value): value is Record<string, unknown> => Boolean(value));
+    for (const propertyMap of propertyMaps) {
+      addCandidate(propertyMap);
+    }
+
+    for (const value of Object.values(currentRecord)) {
+      if (typeof value === 'string') {
+        const parsed = parseJsonRecord(value);
+        if (parsed) {
+          queue.push(parsed);
+        }
+        continue;
+      }
+      if (value && typeof value === 'object') {
+        queue.push(value);
+      }
+    }
+  }
+
+  return candidates;
 }
 
 function collectEmbeddedShadowPropertyCandidates(record: Record<string, unknown>): unknown[] {
