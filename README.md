@@ -112,6 +112,7 @@ Examples:
 - Service API write payload fallbacks remain enabled as a compatibility safety net.
 - Per-poll property refresh (with cached fallback on transient errors) to keep HomeKit target/current values up-to-date.
 - Thermostat write confirmation loop verifies that setpoint actually changed in cloud state; failed convergence is surfaced as HomeKit communication failure instead of silent no-op.
+- Thermostat setpoint writes mirror both effective and command fields (`HeatingSetpoint*` + `SetHeatingSetpoint*`) to keep Salus app and Home app in sync when the cloud updates them asynchronously.
 - Device online state is inferred from Salus connectivity datapoints (`connected`, `OnlineState`, `OnlineStatus_i`, etc.) and mapped to HomeKit reachability so disconnected devices can show as not responding.
 - Immediate short re-poll after write to keep HomeKit state aligned.
 - Detailed logs for auth, discovery, shadow sync, writes, retries, and failures.
