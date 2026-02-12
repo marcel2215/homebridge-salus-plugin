@@ -356,7 +356,7 @@ export class SalusPlatformAccessory {
       minValue: -40,
       maxValue: 100,
       minStep: 0.1,
-    });
+    }).onGet(this.getCurrentTemperature.bind(this));
 
     this.service.getCharacteristic(this.platform.Characteristic.TargetTemperature).setProps({
       minValue: 4.5,
@@ -491,7 +491,7 @@ export class SalusPlatformAccessory {
       this.cachedSystemMode = Math.round(systemModeRaw);
     }
 
-    const currentTemp = currentTempRaw !== undefined
+    let currentTemp = currentTempRaw !== undefined
       ? clamp(normalizeTemperatureFromX100(currentTempRaw), -40, 100)
       : undefined;
     const heatingSetpoint = heatingSetpointRaw !== undefined
@@ -500,6 +500,19 @@ export class SalusPlatformAccessory {
     const coolingSetpoint = coolingSetpointRaw !== undefined
       ? clamp(normalizeTemperatureFromX100(coolingSetpointRaw), 4.5, 35)
       : undefined;
+
+    if (currentTemp === undefined) {
+      const previousCurrentRaw = this.service.getCharacteristic(this.platform.Characteristic.CurrentTemperature).value;
+      const previousCurrent = previousCurrentRaw === null ? undefined : parseCharacteristicNumber(previousCurrentRaw);
+      if (previousCurrent !== undefined) {
+        currentTemp = clamp(previousCurrent, -40, 100);
+      } else {
+        const fallbackCurrent = heatingSetpoint ?? coolingSetpoint;
+        if (fallbackCurrent !== undefined) {
+          currentTemp = clamp(fallbackCurrent, -40, 100);
+        }
+      }
+    }
 
     const targetState = mapSystemModeToTargetState(this.platform.Characteristic.TargetHeatingCoolingState, this.cachedSystemMode, holdTypeRaw);
     const currentState = mapRunningStateToCurrentState(this.platform.Characteristic.CurrentHeatingCoolingState, runningStateRaw, holdTypeRaw);
@@ -542,6 +555,32 @@ export class SalusPlatformAccessory {
       const humidity = humidityRaw > 100 ? humidityRaw / 100 : humidityRaw;
       this.service.updateCharacteristic(this.platform.Characteristic.CurrentRelativeHumidity, clamp(humidity, 0, 100));
     }
+  }
+
+  private getCurrentTemperature(): CharacteristicValue {
+    const currentTempRaw = getNumberProperty(this.latestProperties, THERMOSTAT_CURRENT_TEMP);
+    if (currentTempRaw !== undefined) {
+      return clamp(normalizeTemperatureFromX100(currentTempRaw), -40, 100);
+    }
+
+    const cachedCurrentRaw = this.service.getCharacteristic(this.platform.Characteristic.CurrentTemperature).value;
+    const cachedCurrent = cachedCurrentRaw === null ? undefined : parseCharacteristicNumber(cachedCurrentRaw);
+    if (cachedCurrent !== undefined) {
+      return clamp(cachedCurrent, -40, 100);
+    }
+
+    const fallbackSetpointRaw = this.resolveEffectiveThermostatSetpoint(
+      THERMOSTAT_HEAT_SETPOINT_EFFECTIVE,
+      THERMOSTAT_HEAT_SETPOINT_COMMAND,
+    ) ?? this.resolveEffectiveThermostatSetpoint(
+      THERMOSTAT_COOL_SETPOINT_EFFECTIVE,
+      THERMOSTAT_COOL_SETPOINT_COMMAND,
+    );
+    if (fallbackSetpointRaw !== undefined) {
+      return clamp(normalizeTemperatureFromX100(fallbackSetpointRaw), -40, 100);
+    }
+
+    return 20;
   }
 
   private resolveEffectiveThermostatSetpoint(
