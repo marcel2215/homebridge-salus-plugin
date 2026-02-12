@@ -13,30 +13,128 @@ const DEFAULT_POLL_INTERVAL_SECONDS = 20;
 const DEFAULT_MAX_PARALLEL_PROPERTY_REQUESTS = 4;
 const MIN_POLL_INTERVAL_SECONDS = 10;
 const MAX_POLL_INTERVAL_SECONDS = 300;
+const STALE_ACCESSORY_REMOVAL_GRACE_POLLS = 3;
 
 const THERMOSTAT_PROPERTY_BASES = [
-  'LocalTemperature_x100',
   'HeatingSetpoint_x100',
+  'AutoHeatingSetpoint_x100',
+  'SetAutoHeatingSetpoint_x100',
+  'TargetTemperature_x100',
+  'SetTargetTemperature_x100',
+  'Setpoint_x100',
+  'HeatSetpoint_x100',
+  'OccupiedHeatingSetpoint_x100',
+  'CloudySetpoint_x100',
+  'HeatingSetpoint',
+  'AutoHeatingSetpoint',
+  'SetAutoHeatingSetpoint',
+  'TargetTemperature',
+  'SetTargetTemperature',
+  'Setpoint',
+  'HeatSetpoint',
+  'OccupiedHeatingSetpoint',
+  'CloudySetpoint',
   'CoolingSetpoint_x100',
+  'AutoCoolingSetpoint_x100',
+  'SetAutoCoolingSetpoint_x100',
+  'TargetTemperature_x100',
+  'SetTargetTemperature_x100',
+  'Setpoint_x100',
+  'CoolSetpoint_x100',
+  'OccupiedCoolingSetpoint_x100',
+  'SunnySetpoint_x100',
+  'CoolingSetpoint',
+  'AutoCoolingSetpoint',
+  'SetAutoCoolingSetpoint',
+  'TargetTemperature',
+  'SetTargetTemperature',
+  'Setpoint',
+  'CoolSetpoint',
+  'OccupiedCoolingSetpoint',
+  'SunnySetpoint',
   'SetHeatingSetpoint_x100',
+  'SetHeatingSetpoint',
   'SetCoolingSetpoint_x100',
+  'SetCoolingSetpoint',
   'SetSystemMode',
   'SystemMode',
   'RunningState',
   'RunningMode',
+  'HoldType',
+  'SetHoldType',
+];
+const THERMOSTAT_SETPOINT_PROPERTY_BASES = [
+  'HeatingSetpoint_x100',
+  'AutoHeatingSetpoint_x100',
+  'SetAutoHeatingSetpoint_x100',
+  'HeatSetpoint_x100',
+  'OccupiedHeatingSetpoint_x100',
+  'CloudySetpoint_x100',
+  'HeatingSetpoint',
+  'AutoHeatingSetpoint',
+  'SetAutoHeatingSetpoint',
+  'HeatSetpoint',
+  'OccupiedHeatingSetpoint',
+  'CloudySetpoint',
+  'CoolingSetpoint_x100',
+  'AutoCoolingSetpoint_x100',
+  'SetAutoCoolingSetpoint_x100',
+  'CoolSetpoint_x100',
+  'OccupiedCoolingSetpoint_x100',
+  'SunnySetpoint_x100',
+  'CoolingSetpoint',
+  'AutoCoolingSetpoint',
+  'SetAutoCoolingSetpoint',
+  'CoolSetpoint',
+  'OccupiedCoolingSetpoint',
+  'SunnySetpoint',
+  'SetHeatingSetpoint_x100',
+  'SetHeatingSetpoint',
+  'SetCoolingSetpoint_x100',
+  'SetCoolingSetpoint',
+  'TargetTemperature_x100',
+  'SetTargetTemperature_x100',
+  'Setpoint_x100',
+  'TargetTemperature',
+  'SetTargetTemperature',
+  'Setpoint',
+];
+const THERMOSTAT_MODE_HINT_PROPERTY_BASES = [
+  'SetSystemMode',
+  'SystemMode',
+  'RunningState',
+  'RunningMode',
+  'HoldType',
+  'SetHoldType',
+];
+const THERMOSTAT_TEMP_HINT_PROPERTY_BASES = [
+  'LocalTemperature_x100',
+  'CurrentTemperature_x100',
+  'Temperature_x100',
+  'MeasuredValue_x100',
+  'PresentValue_x100',
+  'CurrentValue_x100',
+  'LocalTemperature',
+  'CurrentTemperature',
+  'Temperature',
+  'MeasuredValue',
+  'PresentValue',
+  'CurrentValue',
+  'RoomTemperature_x100',
+  'RoomTemperature',
 ];
 const LOCK_PROPERTY_BASES = ['Lock', 'LockState', 'LockStatus', 'DoorLock'];
 const POSITION_PROPERTY_BASES = ['CurrentLevel', 'TargetLevel', 'LiftPercentage', 'CurrentPosition'];
 const ONOFF_PROPERTY_BASES = ['OnOff', 'SetOnOff', 'ValveStatus', 'ButtonStatus', 'Mode'];
 const BRIGHTNESS_PROPERTY_BASES = ['CurrentLevel', 'SetLevel', 'Brightness', 'DimLevel'];
-const MOTION_PROPERTY_BASES = ['Motion', 'Occupancy', 'IASZSAlarmed', 'ErrorIASZSAlarmed1'];
+const MOTION_PROPERTY_BASES = ['Motion', 'Occupancy', 'IASZSAlarmed'];
 const CONTACT_PROPERTY_BASES = ['Open', 'Door', 'Window', 'Contact'];
-const LEAK_PROPERTY_BASES = ['Leak', 'WaterLeak', 'ErrorIASZSAlarmed1'];
-const SMOKE_PROPERTY_BASES = ['Smoke', 'Heat', 'ErrorIASZSAlarmed1'];
+const LEAK_PROPERTY_BASES = ['Leak', 'WaterLeak'];
+const SMOKE_PROPERTY_BASES = ['Smoke', 'Heat'];
 const CO_PROPERTY_BASES = ['CO', 'CarbonMonoxide'];
 const TEMPERATURE_PROPERTY_BASES = ['LocalTemperature_x100', 'MeasuredValue_x100', 'Temperature_x100'];
 const HUMIDITY_PROPERTY_BASES = ['Humidity', 'RelativeHumidity'];
-const AIR_QUALITY_PROPERTY_BASES = ['CO2', 'CarbonDioxide'];
+const AIR_QUALITY_PROPERTY_BASES = ['CO2', 'CarbonDioxide', 'CO2_x100', 'CarbonDioxide_x100'];
 
 const UNSUPPORTED_CONSTRAINTS = [
   'Schedules and calendar programs are not directly editable via HomeKit characteristics.',
@@ -56,9 +154,11 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
   private readonly cloudClient: SalusCloudClient | null;
   private readonly pollIntervalMs: number;
   private readonly maxParallelPropertyRequests: number;
+  private readonly missingAccessoryPollCounts: Map<string, number> = new Map();
   private pollTimer: NodeJS.Timeout | null = null;
   private pollInProgress = false;
   private launchCompleted = false;
+  private hasLoggedDuplicateRegisterWorkaround = false;
 
   constructor(
     public readonly log: Logging,
@@ -144,7 +244,7 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
       return;
     }
     if (this.pollInProgress) {
-      this.log.warn('Previous Salus poll is still in progress; delaying next cycle.');
+      this.log.info('Previous Salus poll is still in progress; delaying next cycle.');
       this.schedulePoll(2_000);
       return;
     }
@@ -154,9 +254,10 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
 
     try {
       const devices = await this.cloudClient.listDevices();
-      const uniqueDevices = dedupeDevicesByDsn(devices)
-        .filter((device) => !shouldIgnoreInfrastructureDevice(device));
-
+      const dedupedByDsn = dedupeDevicesByDsn(devices)
+        .filter((device) => !shouldIgnoreInfrastructureDevice(device))
+        .map((device) => ({ ...device, name: sanitizeHomeKitName(device.name, device.model || device.dsn) }));
+      const uniqueDevices = dedupeDevicesByHomeKitUuid(this.api, dedupedByDsn, this.log);
       for (const device of uniqueDevices) {
         discoveredUuids.add(this.api.hap.uuid.generate(`salus:${device.dsn}`));
       }
@@ -173,7 +274,7 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
             const cachedFallback = this.cloudClient!.getCachedProperties(device.dsn);
             const fallbackProperties = cachedFallback ?? new Map();
             const profile = this.deriveProfile(device, fallbackProperties);
-            this.log.warn(
+            this.log.info(
               `Property sync degraded for ${device.name} (${device.dsn}): ${asErrorMessage(error)}.`
               + ` Continuing with ${cachedFallback ? 'cached' : 'empty'} properties.`,
             );
@@ -208,7 +309,22 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
   }
 
   private addAccessory(device: SalusDevice, profile: DeviceProfile, properties: SalusPropertyMap, uuid: string): void {
-    const accessory = new this.api.platformAccessory(device.name, uuid);
+    const accessoryConstructor = this.api.platformAccessory as unknown as PlatformAccessoryConstructorWithInjectionState;
+    if (accessoryConstructor.injectedAccessory) {
+      // Defensive reset for rare stale static injection state from deserialization paths.
+      // When stuck, Homebridge can return an already-bridged HAP accessory object.
+      accessoryConstructor.injectedAccessory = undefined;
+    }
+
+    const accessory = new accessoryConstructor(device.name, uuid);
+    const hapAccessory = (accessory as unknown as PlatformAccessoryWithHapState)._associatedHAPAccessory;
+    if (hapAccessory?.bridge) {
+      this.log.debug(`Accessory ${device.name} (${device.dsn}) was already bridge-associated before registration; resetting stale bridge state.`);
+      // If Homebridge returned a bridged HAP accessory instance unexpectedly,
+      // clear the association so dynamic registration can proceed correctly.
+      hapAccessory.bridge = undefined;
+      hapAccessory.bridged = false;
+    }
     const context = accessory.context as PlatformAccessoryContext;
     context.device = {
       id: device.id,
@@ -224,8 +340,30 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
 
     this.accessories.set(uuid, accessory);
     this.accessoryHandlers.set(uuid, handler);
-    this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
-    this.log.info(`Added accessory: ${device.name} [${device.model}] (${device.dsn})`);
+    this.missingAccessoryPollCounts.delete(uuid);
+    try {
+      this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      this.log.info(`Added accessory: ${device.name} [${device.model}] (${device.dsn})`);
+    } catch (error) {
+      if (isDuplicateBridgeRegistrationError(error)) {
+        if (!this.hasLoggedDuplicateRegisterWorkaround) {
+          this.hasLoggedDuplicateRegisterWorkaround = true;
+          if (this.configTyped.verboseLogging) {
+            this.log.info(
+              'Homebridge emitted a duplicate bridge-registration error while adding accessories.'
+              + ' Keeping accessory registration state and continuing.',
+            );
+          }
+        } else if (this.configTyped.verboseLogging) {
+          this.log.debug(`Duplicate bridge-registration callback ignored for ${device.name} (${device.dsn}).`);
+        }
+        return;
+      }
+      this.accessories.delete(uuid);
+      this.accessoryHandlers.delete(uuid);
+      this.missingAccessoryPollCounts.delete(uuid);
+      throw error;
+    }
   }
 
   private restoreOrUpdateAccessory(
@@ -260,14 +398,35 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
   }
 
   private removeStaleAccessories(discoveredUuids: Set<string>): void {
+    for (const uuid of discoveredUuids) {
+      this.missingAccessoryPollCounts.delete(uuid);
+    }
+
+    let deferredRemovalCount = 0;
     for (const [uuid, accessory] of this.accessories) {
       if (discoveredUuids.has(uuid)) {
         continue;
       }
+
+      const missingPollCount = (this.missingAccessoryPollCounts.get(uuid) ?? 0) + 1;
+      this.missingAccessoryPollCounts.set(uuid, missingPollCount);
+      if (missingPollCount < STALE_ACCESSORY_REMOVAL_GRACE_POLLS) {
+        deferredRemovalCount += 1;
+        continue;
+      }
+
       this.log.info(`Removing stale accessory from cache: ${accessory.displayName}`);
       this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
       this.accessories.delete(uuid);
       this.accessoryHandlers.delete(uuid);
+      this.missingAccessoryPollCounts.delete(uuid);
+    }
+
+    if (deferredRemovalCount > 0) {
+      this.log.info(
+        `Discovery temporarily omitted ${deferredRemovalCount} cached accessory(ies).`
+        + ` Deferring removal until missing for ${STALE_ACCESSORY_REMOVAL_GRACE_POLLS} consecutive polls.`,
+      );
     }
   }
 
@@ -275,7 +434,7 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
     const catalog = getCatalogEntry(device.model);
     const propertyInferredKind = inferKindFromProperties(properties);
     const catalogInferredKind = inferKindFromCatalog(device.model);
-    const kind = propertyInferredKind ?? catalogInferredKind ?? 'switch';
+    const kind = resolveDeviceKind(catalogInferredKind, propertyInferredKind);
 
     const constraints = [...UNSUPPORTED_CONSTRAINTS];
     if (kind === 'thermostat') {
@@ -296,8 +455,20 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
   }
 }
 
+type PlatformAccessoryWithHapState = PlatformAccessory & {
+  _associatedHAPAccessory: {
+    bridge?: unknown;
+    bridged?: boolean;
+  };
+};
+
+interface PlatformAccessoryConstructorWithInjectionState {
+  new (displayName: string, uuid: string): PlatformAccessory;
+  injectedAccessory?: unknown;
+}
+
 function inferKindFromProperties(properties: SalusPropertyMap): DeviceProfile['kind'] | undefined {
-  if (hasAnyPropertyBase(properties, THERMOSTAT_PROPERTY_BASES)) {
+  if (isLikelyThermostat(properties)) {
     return 'thermostat';
   }
   if (hasAnyPropertyBase(properties, LOCK_PROPERTY_BASES)) {
@@ -339,16 +510,150 @@ function inferKindFromProperties(properties: SalusPropertyMap): DeviceProfile['k
   return undefined;
 }
 
+function resolveDeviceKind(
+  catalogInferredKind: DeviceProfile['kind'] | undefined,
+  propertyInferredKind: DeviceProfile['kind'] | undefined,
+): DeviceProfile['kind'] {
+  if (!catalogInferredKind) {
+    return propertyInferredKind ?? 'switch';
+  }
+  if (!propertyInferredKind || propertyInferredKind === catalogInferredKind) {
+    return catalogInferredKind;
+  }
+
+  // Allow property-derived upgrade for broad catalog buckets.
+  if (catalogInferredKind === 'switch' && propertyInferredKind !== 'switch') {
+    return propertyInferredKind;
+  }
+  if (catalogInferredKind === 'temperatureSensor'
+    && (propertyInferredKind === 'humiditySensor' || propertyInferredKind === 'airQualitySensor')) {
+    return propertyInferredKind;
+  }
+
+  return catalogInferredKind;
+}
+
+function isLikelyThermostat(properties: SalusPropertyMap): boolean {
+  if (!hasAnyPropertyBase(properties, THERMOSTAT_PROPERTY_BASES)) {
+    return false;
+  }
+
+  // Generic keys like "Setpoint" appear on non-thermostat devices. Require
+  // a thermostat-specific combination to reduce false positives.
+  const hasSetpoint = hasAnyPropertyBase(properties, THERMOSTAT_SETPOINT_PROPERTY_BASES);
+  const hasModeHint = hasAnyPropertyBase(properties, THERMOSTAT_MODE_HINT_PROPERTY_BASES);
+  const hasTempHint = hasAnyPropertyBase(properties, THERMOSTAT_TEMP_HINT_PROPERTY_BASES);
+
+  return hasSetpoint && (hasModeHint || hasTempHint);
+}
+
 function shouldIgnoreInfrastructureDevice(device: SalusDevice): boolean {
-  return device.model.includes('AG1') || device.model.includes('UG600') || device.model.includes('WZ600');
+  const normalizedModel = device.model.toUpperCase();
+  return normalizedModel.includes('AG1') || normalizedModel.includes('UG600') || normalizedModel.includes('WZ600');
 }
 
 function dedupeDevicesByDsn(devices: SalusDevice[]): SalusDevice[] {
   const byDsn = new Map<string, SalusDevice>();
   for (const device of devices) {
-    byDsn.set(device.dsn, device);
+    const key = canonicalizeDsn(device.dsn);
+    if (!key) {
+      continue;
+    }
+    byDsn.set(key, device);
   }
   return [...byDsn.values()];
+}
+
+function dedupeDevicesByHomeKitUuid(api: API, devices: SalusDevice[], log: Logging): SalusDevice[] {
+  const byUuid = new Map<string, SalusDevice>();
+  for (const device of devices) {
+    const uuid = api.hap.uuid.generate(`salus:${device.dsn}`);
+    const existing = byUuid.get(uuid);
+    if (!existing) {
+      byUuid.set(uuid, device);
+      continue;
+    }
+    const chosen = choosePreferredDevice(existing, device);
+    byUuid.set(uuid, chosen);
+    if (chosen === existing) {
+      log.info(
+        `Discovery produced duplicate HomeKit UUID for ${existing.dsn} and ${device.dsn}.`
+        + ` Keeping ${existing.dsn} and skipping ${device.dsn}.`,
+      );
+    } else {
+      log.info(
+        `Discovery produced duplicate HomeKit UUID for ${existing.dsn} and ${device.dsn}.`
+        + ` Replacing with ${device.dsn}.`,
+      );
+    }
+  }
+  return [...byUuid.values()];
+}
+
+function choosePreferredDevice(left: SalusDevice, right: SalusDevice): SalusDevice {
+  const leftScore = scoreDeviceForDiscoveryPreference(left);
+  const rightScore = scoreDeviceForDiscoveryPreference(right);
+  if (rightScore > leftScore) {
+    return right;
+  }
+  return left;
+}
+
+function scoreDeviceForDiscoveryPreference(device: SalusDevice): number {
+  let score = 0;
+  if (device.model && device.model.trim() !== '') {
+    score += 4;
+  }
+  if (device.name && device.name.trim() !== '') {
+    score += 2;
+  }
+  if (device.productName && device.productName.trim() !== '') {
+    score += 1;
+  }
+  if (device.online !== undefined) {
+    score += 1;
+  }
+  return score;
+}
+
+function canonicalizeDsn(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function sanitizeHomeKitName(name: string, fallback: string): string {
+  const candidate = (name || fallback || '').trim();
+  const normalized = candidate
+    .normalize('NFKD')
+    .replaceAll(/[\u0300-\u036F]/g, '')
+    .replaceAll(/[^A-Za-z0-9' ]+/g, ' ')
+    .replaceAll(/\s+/g, ' ')
+    .trim();
+  const trimmedEdges = normalized
+    .replaceAll(/^[^A-Za-z0-9]+/g, '')
+    .replaceAll(/[^A-Za-z0-9]+$/g, '')
+    .trim();
+  if (trimmedEdges !== '') {
+    return trimmedEdges;
+  }
+
+  const fallbackNormalized = (fallback || 'Salus Device')
+    .normalize('NFKD')
+    .replaceAll(/[\u0300-\u036F]/g, '')
+    .replaceAll(/[^A-Za-z0-9' ]+/g, ' ')
+    .replaceAll(/\s+/g, ' ')
+    .trim();
+  if (fallbackNormalized !== '') {
+    return fallbackNormalized;
+  }
+  return 'Salus Device';
+}
+
+function isDuplicateBridgeRegistrationError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const message = error.message.toLowerCase();
+  return message.includes('already bridged');
 }
 
 async function mapWithConcurrency<T, R>(

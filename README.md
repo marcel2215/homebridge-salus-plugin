@@ -24,7 +24,7 @@ The plugin follows the app's modern cloud stack:
 - Service API base (EU default): `https://service-api.eu.premium.salusconnect.io/api/v1`
 - Service API fallback: `/api/v2`
 - Discovery endpoints (in order): `GET /api/v1/occupants/slider_list` + `GET /api/v1/occupants/slider_details?id=...&type=gateway`, then fallback `GET /devices/`
-- Property shadow endpoint: `GET/POST /devices/device_shadows`
+- Property shadow endpoint: `POST /devices/device_shadows` with `{ "device_codes": [...] }` (with compatibility fallback shapes)
 - Control write endpoint (primary): `POST /devices/bulk` (with fallback payload shapes)
 
 ## Install
@@ -95,6 +95,7 @@ Examples:
 - Exponential backoff retries for transient network/API failures.
 - API base fallback between `/api/v1` and `/api/v2`.
 - Modern discovery fallback from `occupants` API to legacy `/devices` API shape.
+- Bounded `occupants/slider_details` traversal per poll (target-count + time budget) to avoid long stalls during upstream `5xx` bursts.
 - Automatic compatibility fallback to legacy Salus cloud auth/API (multi-path legacy sign-in probe + `/apiv1`) when modern API returns persistent authorization errors (for example `response_code=900008`).
 - Flexible shadow parser for multiple payload shapes.
 - Flexible write payload fallback for service-api compatibility changes.

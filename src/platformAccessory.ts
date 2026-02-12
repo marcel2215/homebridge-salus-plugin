@@ -12,23 +12,137 @@ import {
   getNumberProperty,
   normalizePercentage,
   normalizeTemperatureFromX100,
+  parseNumberLike,
 } from './propertyUtils.js';
 import type { SalusHomebridgePlatform } from './platform.js';
 import type { DeviceProfile, PlatformAccessoryContext, SalusDevice, SalusPropertyMap } from './types.js';
 
-const THERMOSTAT_CURRENT_TEMP = ['LocalTemperature_x100', 'MeasuredValue_x100', 'Temperature_x100', 'MeasuredValue'];
-const THERMOSTAT_HEAT_SETPOINT = ['HeatingSetpoint_x100', 'SetHeatingSetpoint_x100', 'CloudySetpoint_x100'];
-const THERMOSTAT_COOL_SETPOINT = ['CoolingSetpoint_x100', 'SetCoolingSetpoint_x100'];
+const THERMOSTAT_CURRENT_TEMP = [
+  'LocalTemperature_x100',
+  'CurrentTemperature_x100',
+  'PresentValue_x100',
+  'CurrentValue_x100',
+  'Temperature_x100',
+  'MeasuredValue_x100',
+  'LocalTemperature',
+  'CurrentTemperature',
+  'PresentValue',
+  'CurrentValue',
+  'RoomTemperature_x100',
+  'RoomTemperature',
+  'Temperature',
+  'MeasuredValue',
+];
+const THERMOSTAT_HEAT_SETPOINT = [
+  'HeatingSetpoint_x100',
+  'SetHeatingSetpoint_x100',
+  'AutoHeatingSetpoint_x100',
+  'SetAutoHeatingSetpoint_x100',
+  'TargetTemperature_x100',
+  'SetTargetTemperature_x100',
+  'Setpoint_x100',
+  'HeatSetpoint_x100',
+  'OccupiedHeatingSetpoint_x100',
+  'CloudySetpoint_x100',
+  'HeatingSetpoint',
+  'SetHeatingSetpoint',
+  'AutoHeatingSetpoint',
+  'SetAutoHeatingSetpoint',
+  'TargetTemperature',
+  'SetTargetTemperature',
+  'Setpoint',
+  'HeatSetpoint',
+  'OccupiedHeatingSetpoint',
+  'CloudySetpoint',
+];
+const THERMOSTAT_COOL_SETPOINT = [
+  'CoolingSetpoint_x100',
+  'SetCoolingSetpoint_x100',
+  'AutoCoolingSetpoint_x100',
+  'SetAutoCoolingSetpoint_x100',
+  'TargetTemperature_x100',
+  'SetTargetTemperature_x100',
+  'Setpoint_x100',
+  'CoolSetpoint_x100',
+  'OccupiedCoolingSetpoint_x100',
+  'SunnySetpoint_x100',
+  'CoolingSetpoint',
+  'SetCoolingSetpoint',
+  'AutoCoolingSetpoint',
+  'SetAutoCoolingSetpoint',
+  'TargetTemperature',
+  'SetTargetTemperature',
+  'Setpoint',
+  'CoolSetpoint',
+  'OccupiedCoolingSetpoint',
+  'SunnySetpoint',
+];
 const THERMOSTAT_SYSTEM_MODE = ['SystemMode', 'SetSystemMode'];
 const THERMOSTAT_RUNNING_STATE = ['RunningState', 'RunningMode'];
 const THERMOSTAT_HOLD_TYPE = ['HoldType', 'SetHoldType'];
-const THERMOSTAT_HUMIDITY = ['RelativeHumidity', 'Humidity', 'SunnySetpoint_x100'];
+const THERMOSTAT_HUMIDITY = ['RelativeHumidity_x100', 'RelativeHumidity', 'Humidity_x100', 'Humidity'];
 
 const WRITE_SYSTEM_MODE = ['SetSystemMode', 'SystemMode'];
-const WRITE_HEAT_SETPOINT = ['SetHeatingSetpoint_x100', 'HeatingSetpoint_x100'];
-const WRITE_COOL_SETPOINT = ['SetCoolingSetpoint_x100', 'CoolingSetpoint_x100'];
-const WRITE_AUTO_HEAT_SETPOINT = ['SetAutoHeatingSetpoint_x100', 'SetHeatingSetpoint_x100', 'HeatingSetpoint_x100'];
-const WRITE_AUTO_COOL_SETPOINT = ['SetAutoCoolingSetpoint_x100', 'SetCoolingSetpoint_x100', 'CoolingSetpoint_x100'];
+const WRITE_HEAT_SETPOINT = [
+  'SetHeatingSetpoint_x100',
+  'HeatingSetpoint_x100',
+  'SetTargetTemperature_x100',
+  'TargetTemperature_x100',
+  'Setpoint_x100',
+  'CloudySetpoint_x100',
+  'SetHeatingSetpoint',
+  'HeatingSetpoint',
+  'SetTargetTemperature',
+  'TargetTemperature',
+  'Setpoint',
+  'CloudySetpoint',
+];
+const WRITE_COOL_SETPOINT = [
+  'SetCoolingSetpoint_x100',
+  'CoolingSetpoint_x100',
+  'SetTargetTemperature_x100',
+  'TargetTemperature_x100',
+  'Setpoint_x100',
+  'SunnySetpoint_x100',
+  'SetCoolingSetpoint',
+  'CoolingSetpoint',
+  'SetTargetTemperature',
+  'TargetTemperature',
+  'Setpoint',
+  'SunnySetpoint',
+];
+const WRITE_AUTO_HEAT_SETPOINT = [
+  'SetAutoHeatingSetpoint_x100',
+  'SetHeatingSetpoint_x100',
+  'HeatingSetpoint_x100',
+  'SetTargetTemperature_x100',
+  'TargetTemperature_x100',
+  'Setpoint_x100',
+  'CloudySetpoint_x100',
+  'SetAutoHeatingSetpoint',
+  'SetHeatingSetpoint',
+  'HeatingSetpoint',
+  'SetTargetTemperature',
+  'TargetTemperature',
+  'Setpoint',
+  'CloudySetpoint',
+];
+const WRITE_AUTO_COOL_SETPOINT = [
+  'SetAutoCoolingSetpoint_x100',
+  'SetCoolingSetpoint_x100',
+  'CoolingSetpoint_x100',
+  'SetTargetTemperature_x100',
+  'TargetTemperature_x100',
+  'Setpoint_x100',
+  'SunnySetpoint_x100',
+  'SetAutoCoolingSetpoint',
+  'SetCoolingSetpoint',
+  'CoolingSetpoint',
+  'SetTargetTemperature',
+  'TargetTemperature',
+  'Setpoint',
+  'SunnySetpoint',
+];
 const WRITE_ON_OFF = ['SetOnOff', 'OnOff', 'ValveStatus', 'ButtonStatus', 'Mode'];
 const WRITE_LEVEL = ['SetLevel', 'CurrentLevel', 'Level', 'Brightness', 'DimLevel'];
 const WRITE_POSITION = ['TargetPosition', 'TargetLevel', 'CurrentLevel', 'LiftPercentage'];
@@ -348,18 +462,32 @@ export class SalusPlatformAccessory {
     const currentState = mapRunningStateToCurrentState(this.platform.Characteristic.CurrentHeatingCoolingState, runningStateRaw, holdTypeRaw);
     this.cachedTargetState = targetState;
 
-    let targetTemp = heatingSetpoint ?? coolingSetpoint ?? 21;
-    if (targetState === this.platform.Characteristic.TargetHeatingCoolingState.COOL && coolingSetpoint !== undefined) {
-      targetTemp = coolingSetpoint;
+    let targetTemp: number | undefined;
+    if (targetState === this.platform.Characteristic.TargetHeatingCoolingState.COOL) {
+      targetTemp = coolingSetpoint ?? heatingSetpoint;
+    } else {
+      targetTemp = heatingSetpoint ?? coolingSetpoint;
     }
-    if (targetState === this.platform.Characteristic.TargetHeatingCoolingState.OFF) {
-      targetTemp = heatingSetpoint ?? coolingSetpoint ?? targetTemp;
+    if (targetTemp === undefined) {
+      targetTemp = currentTemp;
+    }
+    if (targetTemp === undefined) {
+      const previousTargetRaw = this.service.getCharacteristic(this.platform.Characteristic.TargetTemperature).value;
+      const previousTarget = previousTargetRaw === null ? undefined : parseCharacteristicNumber(previousTargetRaw);
+      if (previousTarget !== undefined) {
+        targetTemp = clamp(previousTarget, 4.5, 35);
+      }
     }
 
     if (currentTemp !== undefined) {
       this.service.updateCharacteristic(this.platform.Characteristic.CurrentTemperature, currentTemp);
     }
-    this.service.updateCharacteristic(this.platform.Characteristic.TargetTemperature, targetTemp);
+    if (targetTemp !== undefined) {
+      this.service.updateCharacteristic(
+        this.platform.Characteristic.TargetTemperature,
+        clamp(targetTemp, 4.5, 35),
+      );
+    }
     this.service.updateCharacteristic(this.platform.Characteristic.TargetHeatingCoolingState, targetState);
     this.service.updateCharacteristic(this.platform.Characteristic.CurrentHeatingCoolingState, currentState);
 
@@ -498,13 +626,22 @@ export class SalusPlatformAccessory {
   }
 
   private updateAirQualityCharacteristics(): void {
-    const co2 = getNumberProperty(this.latestProperties, ['MeasuredValue', 'CO2', 'CarbonDioxide']);
-    if (co2 === undefined) {
+    const co2Raw = getNumberProperty(this.latestProperties, [
+      'MeasuredValue',
+      'MeasuredValue_x100',
+      'CO2',
+      'CO2_x100',
+      'CarbonDioxide',
+      'CarbonDioxide_x100',
+    ]);
+    if (co2Raw === undefined) {
       return;
     }
+    const co2 = co2Raw > 10_000 ? Math.round(co2Raw / 100) : Math.round(co2Raw);
+    const boundedCo2 = clamp(co2, 0, 100_000);
 
-    this.service.updateCharacteristic(this.platform.Characteristic.CarbonDioxideLevel, co2);
-    if (co2 >= 1000) {
+    this.service.updateCharacteristic(this.platform.Characteristic.CarbonDioxideLevel, boundedCo2);
+    if (boundedCo2 >= 1000) {
       this.service.updateCharacteristic(
         this.platform.Characteristic.CarbonDioxideDetected,
         this.platform.Characteristic.CarbonDioxideDetected.CO2_LEVELS_ABNORMAL,
@@ -579,7 +716,8 @@ export class SalusPlatformAccessory {
     }
 
     const targetTemperature = clamp(numericValue, 4.5, 35);
-    const scaled = Math.round(targetTemperature * 100);
+    const scaledX100 = Math.round(targetTemperature * 100);
+    const scaledPlain = Math.round(targetTemperature * 10) / 10;
     const targetState = this.cachedTargetState;
 
     const writes: Array<{ property: string; value: unknown }> = [];
@@ -596,8 +734,13 @@ export class SalusPlatformAccessory {
       if (!property || queuedProperties.has(property)) {
         return;
       }
+      const sample = this.getPropertyValue(property);
+      const numericSample = parseNumberLike(sample);
+      const lowerProperty = property.toLowerCase();
+      const propertyNameLooksX100 = lowerProperty.includes('_x100') || lowerProperty.endsWith('x100');
+      const sampleLooksX100 = propertyNameLooksX100 || (numericSample !== undefined && Math.abs(numericSample) >= 100);
       queuedProperties.add(property);
-      writes.push({ property, value: scaled });
+      writes.push({ property, value: sampleLooksX100 ? scaledX100 : scaledPlain });
     };
 
     if (targetState === this.platform.Characteristic.TargetHeatingCoolingState.COOL) {
@@ -637,13 +780,17 @@ export class SalusPlatformAccessory {
     if (hkStateRaw === undefined) {
       throw this.communicationFailure('Received invalid thermostat mode value from HomeKit');
     }
-    const hkState = Math.round(hkStateRaw);
+    const hkStateRounded = Math.round(hkStateRaw);
+    let hkState = this.platform.Characteristic.TargetHeatingCoolingState.AUTO;
     let mode = SALUS_MODE.auto;
-    if (hkState === this.platform.Characteristic.TargetHeatingCoolingState.OFF) {
+    if (hkStateRounded === this.platform.Characteristic.TargetHeatingCoolingState.OFF) {
+      hkState = this.platform.Characteristic.TargetHeatingCoolingState.OFF;
       mode = SALUS_MODE.off;
-    } else if (hkState === this.platform.Characteristic.TargetHeatingCoolingState.COOL) {
+    } else if (hkStateRounded === this.platform.Characteristic.TargetHeatingCoolingState.COOL) {
+      hkState = this.platform.Characteristic.TargetHeatingCoolingState.COOL;
       mode = SALUS_MODE.cool;
-    } else if (hkState === this.platform.Characteristic.TargetHeatingCoolingState.HEAT) {
+    } else if (hkStateRounded === this.platform.Characteristic.TargetHeatingCoolingState.HEAT) {
+      hkState = this.platform.Characteristic.TargetHeatingCoolingState.HEAT;
       mode = SALUS_MODE.heat;
     }
 
@@ -707,12 +854,7 @@ export class SalusPlatformAccessory {
     }
 
     const sample = this.getPropertyValue(property);
-    let outgoingValue: number | string = target;
-    if (typeof sample === 'number' && sample > 100) {
-      outgoingValue = Math.round((target / 100) * 255);
-    } else if (typeof sample === 'string') {
-      outgoingValue = encodePercentageLike(sample, target);
-    }
+    const outgoingValue = encodePercentageLike(sample, target);
 
     await this.platform.writeDeviceProperty(this.device, property, outgoingValue);
     this.platform.log.info(`Set brightness for ${this.device.name} to ${target}%`);
@@ -905,7 +1047,7 @@ function mapRunningStateToCurrentState(
   }
 
   const normalized = Math.round(runningStateRaw);
-  if (normalized === 0) {
+  if (!Number.isFinite(normalized) || normalized <= 0) {
     return characteristic.OFF;
   }
   if (normalized === 1 || normalized === 4) {
@@ -941,6 +1083,16 @@ function parseCharacteristicNumber(value: CharacteristicValue): number | undefin
 function parseCharacteristicBoolean(value: CharacteristicValue): boolean | undefined {
   if (typeof value === 'boolean') {
     return value;
+  }
+
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true' || normalized === 'on') {
+      return true;
+    }
+    if (normalized === 'false' || normalized === 'off') {
+      return false;
+    }
   }
 
   const numeric = parseCharacteristicNumber(value);

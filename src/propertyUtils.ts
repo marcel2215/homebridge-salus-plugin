@@ -58,10 +58,12 @@ export function parseNumberLike(value: unknown): number | undefined {
 }
 
 export function hasAnyPropertyBase(map: SalusPropertyMap, baseNames: string[]): boolean {
-  const names = new Set(baseNames);
+  const names = new Set(baseNames.map((value) => value.trim()).filter((value) => value.length > 0));
   for (const prop of map.values()) {
-    if (names.has(prop.baseName)) {
-      return true;
+    for (const candidate of names) {
+      if (propertyNameMatchesCandidate(prop, candidate)) {
+        return true;
+      }
     }
   }
   return false;
@@ -70,7 +72,7 @@ export function hasAnyPropertyBase(map: SalusPropertyMap, baseNames: string[]): 
 export function findPropertyByBaseName(map: SalusPropertyMap, baseNames: string[]): string | undefined {
   for (const baseName of baseNames) {
     for (const [name, prop] of map) {
-      if (prop.baseName === baseName || name === baseName) {
+      if (propertyNameMatchesCandidate(prop, baseName) || propertyNameMatchesCandidateName(name, baseName)) {
         return name;
       }
     }
@@ -81,7 +83,7 @@ export function findPropertyByBaseName(map: SalusPropertyMap, baseNames: string[
 export function getNumberProperty(map: SalusPropertyMap, baseNames: string[]): number | undefined {
   for (const baseName of baseNames) {
     for (const prop of map.values()) {
-      if (prop.baseName === baseName || prop.name === baseName) {
+      if (propertyNameMatchesCandidate(prop, baseName)) {
         const parsed = parseNumberLike(prop.value);
         if (parsed !== undefined) {
           return parsed;
@@ -95,7 +97,7 @@ export function getNumberProperty(map: SalusPropertyMap, baseNames: string[]): n
 export function getStringProperty(map: SalusPropertyMap, baseNames: string[]): string | undefined {
   for (const baseName of baseNames) {
     for (const prop of map.values()) {
-      if (prop.baseName === baseName || prop.name === baseName) {
+      if (propertyNameMatchesCandidate(prop, baseName)) {
         if (typeof prop.value === 'string') {
           return prop.value;
         }
@@ -108,7 +110,7 @@ export function getStringProperty(map: SalusPropertyMap, baseNames: string[]): s
 export function getBooleanProperty(map: SalusPropertyMap, baseNames: string[]): boolean | undefined {
   for (const baseName of baseNames) {
     for (const prop of map.values()) {
-      if (prop.baseName === baseName || prop.name === baseName) {
+      if (propertyNameMatchesCandidate(prop, baseName)) {
         const parsed = parseBooleanLike(prop.value);
         if (parsed !== undefined) {
           return parsed;
@@ -129,13 +131,7 @@ export function normalizeTemperatureFromX100(value: number): number {
 export function normalizePercentage(value: unknown): number | undefined {
   const numeric = parseNumberLike(value);
   if (numeric !== undefined) {
-    if (numeric <= 1 && numeric >= 0) {
-      return Math.round(numeric * 100);
-    }
-    if (numeric > 100 && numeric <= 255) {
-      return clamp(Math.round((numeric / 255) * 100), 0, 100);
-    }
-    return clamp(Math.round(numeric), 0, 100);
+    return normalizeNumericPercentage(numeric);
   }
 
   if (typeof value === 'string') {
@@ -151,10 +147,19 @@ export function normalizePercentage(value: unknown): number | undefined {
 
 export function encodePercentageLike(sample: unknown, percentage: number): number | string {
   const bounded = clamp(Math.round(percentage), 0, 100);
+  if (typeof sample === 'number' && Number.isFinite(sample)) {
+    return encodeNumericPercentageLike(sample, bounded);
+  }
   if (typeof sample === 'string' && /^[0-9a-fA-F]{6}$/.test(sample.trim())) {
     const suffix = sample.trim().slice(2);
     const scaled = Math.round((bounded / 100) * 255).toString(16).padStart(2, '0').toUpperCase();
     return `${scaled}${suffix}`;
+  }
+  if (typeof sample === 'string') {
+    const numericSample = parseNumberLike(sample);
+    if (numericSample !== undefined) {
+      return String(encodeNumericPercentageLike(numericSample, bounded));
+    }
   }
   return bounded;
 }
@@ -207,4 +212,51 @@ function preserveStringCase(sample: string, nextValue: string): string {
     return `${nextValue[0]?.toUpperCase() ?? ''}${nextValue.slice(1)}`;
   }
   return nextValue;
+}
+
+function normalizeNumericPercentage(numeric: number): number {
+  if (numeric <= 1 && numeric >= 0) {
+    return Math.round(numeric * 100);
+  }
+  if (Math.abs(numeric) > 100 && Math.abs(numeric) <= 255) {
+    return clamp(Math.round((numeric / 255) * 100), 0, 100);
+  }
+  // Some payloads encode percentages as integer x100 (0..10000).
+  if (Math.abs(numeric) > 255 && Math.abs(numeric) <= 10_000 && Number.isInteger(numeric)) {
+    return clamp(Math.round(numeric / 100), 0, 100);
+  }
+  return clamp(Math.round(numeric), 0, 100);
+}
+
+function encodeNumericPercentageLike(sample: number, boundedPercentage: number): number {
+  if (sample <= 1 && sample >= 0) {
+    return Math.round((boundedPercentage / 100) * 1_000) / 1_000;
+  }
+  if (Math.abs(sample) > 100 && Math.abs(sample) <= 255) {
+    return Math.round((boundedPercentage / 100) * 255);
+  }
+  if (Math.abs(sample) > 255 && Math.abs(sample) <= 10_000 && Number.isInteger(sample)) {
+    return Math.round(boundedPercentage * 100);
+  }
+  return boundedPercentage;
+}
+
+function propertyNameMatchesCandidate(prop: { baseName: string; name: string }, candidate: string): boolean {
+  return propertyNameMatchesCandidateName(prop.baseName, candidate) || propertyNameMatchesCandidateName(prop.name, candidate);
+}
+
+function propertyNameMatchesCandidateName(actualName: string, candidate: string): boolean {
+  const actual = actualName.trim().toLowerCase();
+  const expected = candidate.trim().toLowerCase();
+  if (!actual || !expected) {
+    return false;
+  }
+  if (actual === expected) {
+    return true;
+  }
+
+  // Accept namespaced property paths seen in some payload variants.
+  return actual.endsWith(`:${expected}`)
+    || actual.endsWith(`.${expected}`)
+    || actual.endsWith(`/${expected}`);
 }

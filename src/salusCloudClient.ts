@@ -20,6 +20,9 @@ interface RequestOptions {
   body?: unknown;
   auth?: boolean;
   allow401Refresh?: boolean;
+  allowCompanyCodeRotation?: boolean;
+  activeServiceBaseOnly?: boolean;
+  maxAttempts?: number;
   expectedStatuses?: number[];
 }
 
@@ -103,6 +106,11 @@ const SESSION_REFRESH_SAFETY_MS = 60_000;
 const LEGACY_SESSION_REFRESH_SAFETY_MS = 60_000;
 const LEGACY_DEFAULT_SESSION_TTL_MS = 45 * 60_000;
 const MAX_UNAUTHORIZED_RECOVERY_STEPS = 48;
+const SLIDER_DETAILS_BLOCK_TTL_MS = 15 * 60_000;
+const DEVICE_SHADOW_BLOCK_TTL_MS = 15 * 60_000;
+const MAX_OCCUPANTS_DETAIL_TARGETS_PER_SYNC = 40;
+const MAX_OCCUPANTS_DETAIL_DISCOVERY_DURATION_MS = 45_000;
+const MAX_OCCUPANTS_DETAIL_TYPES_PER_TARGET = 4;
 
 const STATUS_ALLOW_PATH_FALLBACK = new Set([404, 405, 426]);
 const STATUS_ALLOW_WRITE_SHAPE_FALLBACK = new Set([400, 404, 405, 409, 415, 422]);
@@ -163,19 +171,27 @@ const OCCUPANTS_SLIDER_LIST_PATH_GROUPS = [
   ['/occupants/slider_list?type=home', '/api/v1/occupants/slider_list?type=home'],
   ['/occupants/slider_list?type=site', '/api/v1/occupants/slider_list?type=site'],
 ];
-const OCCUPANTS_SLIDER_DETAIL_TYPE_FALLBACKS = ['gateway', 'occupant', 'home', 'house', 'site', 'group', 'location', 'zone', 'room'];
+const OCCUPANTS_SLIDER_DETAIL_TYPE_FALLBACKS = ['gateway', 'occupant', 'home', 'site'];
 
 const METADATA_FIELD_NAMES = new Set([
   'id',
   'key',
   'dsn',
   'name',
+  'device_name',
   'model',
+  'model_name',
+  'device_model',
+  'product_class',
+  'layout',
   'product_name',
   'oem_model',
   'type',
   'status',
   'online',
+  'offline',
+  'enabled',
+  'disabled',
   'created_at',
   'updated_at',
   'timestamp',
@@ -187,9 +203,30 @@ const METADATA_FIELD_NAMES = new Set([
   'value',
   'gateway',
   'gateway_id',
+  'gateway_name',
+  'home_id',
+  'home_name',
+  'house_id',
+  'house_name',
+  'site_id',
+  'site_name',
+  'room_id',
+  'room_name',
+  'location_id',
+  'location_name',
+  'category_id',
+  'category_name',
+  'serial_number',
+  'serialNumber',
+  'mac_address',
+  'mac',
+  'ieee_address',
+  'firmware_version',
+  'hardware_version',
   'user_id',
   'occupant_id',
 ]);
+const METADATA_FIELD_NAMES_LOWER = new Set([...METADATA_FIELD_NAMES].map((value) => value.toLowerCase()));
 
 export class SalusCloudClient {
   private session: CognitoSession | null = null;
@@ -220,10 +257,11 @@ export class SalusCloudClient {
   private readonly propertyCacheByDsn: Map<string, SalusPropertyMap> = new Map();
   private readonly deviceIdToDsn: Map<string, string> = new Map();
   private readonly deviceKeyToDsn: Map<string, string> = new Map();
-  private readonly blockedSliderDetailsTargetIds: Set<string> = new Set();
-  private readonly blockedPropertyShadowDsns: Set<string> = new Set();
-  private skipModernDeviceShadows = false;
+  private readonly blockedSliderDetailsTargets = new Map<string, number>();
+  private blockedAllSliderDetailsUntilEpochMs = 0;
+  private blockedModernDeviceShadowUntilEpochMs = 0;
   private hasWarnedAboutSliderDetailsAuthFailure = false;
+  private hasWarnedAboutSliderDetailsTransientFailure = false;
   private hasWarnedAboutDeviceShadowAuthFailure = false;
   private hasWarnedAboutLegacyProbeFailure = false;
   private hasWarnedAboutPartialDiscoveryFallback = false;
@@ -359,7 +397,7 @@ export class SalusCloudClient {
       if (!shouldTryAlternateDiscovery(error)) {
         throw error;
       }
-      this.log.warn(`AWS occupants discovery failed. Falling back to /devices endpoint (${asErrorMessage(error)})`);
+      this.log.info(`AWS occupants discovery failed. Falling back to /devices endpoint (${asErrorMessage(error)})`);
     }
 
     try {
@@ -389,7 +427,6 @@ export class SalusCloudClient {
 
     const devices = parseDevices(payload);
     this.rebuildDeviceIndex(devices);
-    const inlinePropertiesFromRecords = this.hydratePropertyCacheFromDeviceRecords(devices, '/devices payload');
 
     const inlineShadows = parseDeviceShadows(payload, this.deviceIdToDsn, this.deviceKeyToDsn);
     if (inlineShadows.size > 0) {
@@ -398,10 +435,12 @@ export class SalusCloudClient {
         this.log.debug(`Hydrated property cache from /devices response for ${inlineShadows.size} device(s)`);
       }
     }
+    const inlinePropertiesFromRecords = this.hydratePropertyCacheFromDeviceRecords(devices, '/devices payload');
 
-    if (!this.skipModernDeviceShadows) {
+    if (!this.isModernDeviceShadowBlocked()) {
       try {
         const shadowPayload = await this.fetchDeviceShadows(devices);
+        this.unblockModernDeviceShadows();
         if (shadowPayload.size > 0) {
           this.mergeIntoPropertyCache(shadowPayload);
           if (this.verboseLogging) {
@@ -412,16 +451,9 @@ export class SalusCloudClient {
         }
       } catch (error) {
         if (this.shouldDisableModernDeviceShadowQueries(error)) {
-          this.skipModernDeviceShadows = true;
-          if (!this.hasWarnedAboutDeviceShadowAuthFailure) {
-            this.hasWarnedAboutDeviceShadowAuthFailure = true;
-            this.log.warn(
-              `Salus cloud denied devices/device_shadows (${asErrorMessage(error)}).`
-              + ' Continuing sync with inline occupants/devices payload properties only.',
-            );
-          } else if (this.verboseLogging) {
-            this.log.debug(`Skipping devices/device_shadows after prior authorization failure: ${asErrorMessage(error)}`);
-          }
+          this.blockModernDeviceShadows(
+            `Salus cloud denied devices/device_shadows (${asErrorMessage(error)}).`,
+          );
         } else if (shouldTryAlternateDiscovery(error) || error instanceof LegacyFallbackRequiredError) {
           this.log.warn(`Device shadow query failed after /devices discovery (${asErrorMessage(error)}). Continuing with available data.`);
         } else {
@@ -443,6 +475,8 @@ export class SalusCloudClient {
     const occupantsPayloads: unknown[] = [];
     const targetQueue: OccupantsSliderTarget[] = [];
     const queuedTargets = new Set<string>();
+    const discoveryStartedAt = Date.now();
+    this.hasWarnedAboutSliderDetailsTransientFailure = false;
 
     const mergeShadowsFromPayload = (payload: unknown): void => {
       const parsed = parseDeviceShadows(payload, this.deviceIdToDsn, this.deviceKeyToDsn);
@@ -458,12 +492,18 @@ export class SalusCloudClient {
 
     const addTargets = (targets: OccupantsSliderTarget[]): void => {
       for (const target of targets) {
-        const key = sliderTargetKey(target);
-        if (queuedTargets.has(key)) {
+        const targetId = target.id.trim();
+        if (!targetId) {
           continue;
         }
-        queuedTargets.add(key);
-        targetQueue.push(target);
+        if (queuedTargets.has(targetId)) {
+          continue;
+        }
+        queuedTargets.add(targetId);
+        targetQueue.push({
+          ...target,
+          id: targetId,
+        });
       }
     };
 
@@ -505,25 +545,64 @@ export class SalusCloudClient {
     }
 
     const visitedTargetIds = new Set<string>();
+    let processedTargetCount = 0;
+    let detailTraversalTruncatedReason: string | undefined;
     while (targetQueue.length > 0) {
+      if (processedTargetCount >= MAX_OCCUPANTS_DETAIL_TARGETS_PER_SYNC) {
+        detailTraversalTruncatedReason = `target limit (${MAX_OCCUPANTS_DETAIL_TARGETS_PER_SYNC}) reached`;
+        break;
+      }
+      if ((Date.now() - discoveryStartedAt) >= MAX_OCCUPANTS_DETAIL_DISCOVERY_DURATION_MS) {
+        detailTraversalTruncatedReason = `time budget (${MAX_OCCUPANTS_DETAIL_DISCOVERY_DURATION_MS}ms) exhausted`;
+        break;
+      }
+
       const nextTarget = targetQueue.shift();
       if (!nextTarget) {
         continue;
       }
 
-      const targetIdKey = nextTarget.id.trim();
-      if (visitedTargetIds.has(targetIdKey)) {
+      const targetId = nextTarget.id.trim();
+      if (!targetId || visitedTargetIds.has(targetId)) {
         continue;
       }
-      visitedTargetIds.add(targetIdKey);
+      visitedTargetIds.add(targetId);
+      processedTargetCount += 1;
 
-      const detailPayloads = await this.fetchOccupantsSliderDetailsPayloads(nextTarget);
+      let detailPayloads: unknown[];
+      try {
+        detailPayloads = await this.fetchOccupantsSliderDetailsPayloads(nextTarget);
+      } catch (error) {
+        if (shouldTryAlternateDiscovery(error)) {
+          if (!this.hasWarnedAboutSliderDetailsTransientFailure) {
+            this.hasWarnedAboutSliderDetailsTransientFailure = true;
+            this.log.info(
+              `Salus occupants slider_details is temporarily unavailable (${asErrorMessage(error)}).`
+              + ' Continuing discovery with available slider_list/device payload data.',
+            );
+          } else if (this.verboseLogging) {
+            this.log.debug(`Skipping transient slider_details failure for id=${targetId}: ${asErrorMessage(error)}`);
+          }
+          continue;
+        }
+        throw error;
+      }
       for (const detailPayload of detailPayloads) {
         occupantsPayloads.push(detailPayload);
         discoveredDevices.push(...parseDevices(detailPayload));
         mergeShadowsFromPayload(detailPayload);
         addTargets(extractOccupantsSliderTargets(detailPayload));
       }
+    }
+    if (detailTraversalTruncatedReason) {
+      this.log.info(
+        `Occupants slider_details traversal truncated: ${detailTraversalTruncatedReason}.`
+        + ` Processed ${processedTargetCount} target(s), ${targetQueue.length} target(s) deferred to next sync.`,
+      );
+    } else if (this.verboseLogging) {
+      this.log.debug(
+        `Occupants slider_details traversal completed (${processedTargetCount} targets in ${Date.now() - discoveryStartedAt}ms).`,
+      );
     }
 
     const devices = dedupeDevicesByDsn(discoveredDevices);
@@ -563,9 +642,10 @@ export class SalusCloudClient {
       }
     }
 
-    if (!this.skipModernDeviceShadows) {
+    if (!this.isModernDeviceShadowBlocked()) {
       try {
         const shadowPayload = await this.fetchDeviceShadows(devices);
+        this.unblockModernDeviceShadows();
         if (shadowPayload.size > 0) {
           this.mergeIntoPropertyCache(shadowPayload);
           if (this.verboseLogging) {
@@ -576,16 +656,9 @@ export class SalusCloudClient {
         }
       } catch (error) {
         if (this.shouldDisableModernDeviceShadowQueries(error)) {
-          this.skipModernDeviceShadows = true;
-          if (!this.hasWarnedAboutDeviceShadowAuthFailure) {
-            this.hasWarnedAboutDeviceShadowAuthFailure = true;
-            this.log.warn(
-              `Salus cloud denied devices/device_shadows (${asErrorMessage(error)}).`
-              + ' Continuing sync with inline occupants/devices payload properties only.',
-            );
-          } else if (this.verboseLogging) {
-            this.log.debug(`Skipping devices/device_shadows after prior authorization failure: ${asErrorMessage(error)}`);
-          }
+          this.blockModernDeviceShadows(
+            `Salus cloud denied devices/device_shadows (${asErrorMessage(error)}).`,
+          );
         } else if (shouldTryAlternateDiscovery(error) || error instanceof LegacyFallbackRequiredError) {
           this.log.warn(`Device shadow query failed after occupants discovery (${asErrorMessage(error)}). Continuing with available data.`);
         } else {
@@ -603,13 +676,22 @@ export class SalusCloudClient {
 
   private async fetchOccupantsSliderDetailsPayloads(target: OccupantsSliderTarget): Promise<unknown[]> {
     const normalizedTargetId = target.id.trim();
-    if (!normalizedTargetId || this.blockedSliderDetailsTargetIds.has(normalizedTargetId)) {
+    if (!normalizedTargetId) {
+      return [];
+    }
+
+    if (this.isAllSliderDetailsBlocked()) {
+      return [];
+    }
+
+    if (this.isSliderDetailsTargetBlocked(normalizedTargetId)) {
       return [];
     }
 
     const payloads: unknown[] = [];
     const pathGroups = buildSliderDetailsPathGroups(target.id, target.typeHints);
     let lastError: unknown;
+    let sawAuthRestriction = false;
 
     for (const pathGroup of pathGroups) {
       try {
@@ -618,34 +700,31 @@ export class SalusCloudClient {
           {
             method: 'GET',
             auth: true,
+            allow401Refresh: false,
+            allowCompanyCodeRotation: false,
+            activeServiceBaseOnly: true,
+            maxAttempts: 1,
           },
         );
         payloads.push(payload);
 
         if (parseDevices(payload).length > 0) {
+          this.unblockSliderDetailsTarget(normalizedTargetId);
+          this.unblockAllSliderDetails();
           return payloads;
         }
       } catch (error) {
         lastError = error;
-        if (error instanceof LegacyFallbackRequiredError) {
-          this.blockedSliderDetailsTargetIds.add(normalizedTargetId);
-          if (!this.hasWarnedAboutSliderDetailsAuthFailure) {
-            this.hasWarnedAboutSliderDetailsAuthFailure = true;
-            this.log.warn(
-              `Salus cloud denied /occupants/slider_details for id=${normalizedTargetId}.`
-              + ' Continuing with slider_list discovery only and skipping restricted slider_details targets.',
-            );
-          } else if (this.verboseLogging) {
-            this.log.debug(`Skipping restricted /occupants/slider_details target id=${normalizedTargetId}.`);
-          }
-          return payloads;
-        }
-        if (error instanceof HttpStatusError && (error.status === 401 || error.status === 403)) {
-          this.blockedSliderDetailsTargetIds.add(normalizedTargetId);
+        if (error instanceof LegacyFallbackRequiredError
+          || (error instanceof HttpStatusError && (error.status === 401 || error.status === 403))) {
+          sawAuthRestriction = true;
           if (this.verboseLogging) {
-            this.log.debug(`Skipping unauthorized /occupants/slider_details target id=${normalizedTargetId}.`);
+            this.log.debug(
+              `Restricted /occupants/slider_details target id=${normalizedTargetId}`
+              + ` for path variant ${pathGroup[0] ?? '<unknown>'}: ${asErrorMessage(error)}`,
+            );
           }
-          return payloads;
+          break;
         }
         if (error instanceof HttpStatusError && STATUS_ALLOW_OCCUPANTS_VARIANT_FALLBACK.has(error.status)) {
           continue;
@@ -655,7 +734,25 @@ export class SalusCloudClient {
     }
 
     if (payloads.length > 0) {
+      this.unblockSliderDetailsTarget(normalizedTargetId);
+      this.unblockAllSliderDetails();
       return payloads;
+    }
+
+    if (sawAuthRestriction) {
+      this.blockSliderDetailsTarget(normalizedTargetId);
+      this.blockAllSliderDetails();
+      if (!this.hasWarnedAboutSliderDetailsAuthFailure) {
+        this.hasWarnedAboutSliderDetailsAuthFailure = true;
+        this.log.info(
+          `Salus cloud denied /occupants/slider_details for id=${normalizedTargetId}.`
+          + ' Continuing with slider_list discovery only and pausing slider_details for'
+          + ` ${Math.round(SLIDER_DETAILS_BLOCK_TTL_MS / 60_000)} minutes.`,
+        );
+      } else if (this.verboseLogging) {
+        this.log.debug(`Temporarily skipping restricted /occupants/slider_details target id=${normalizedTargetId}.`);
+      }
+      return [];
     }
 
     if (lastError instanceof HttpStatusError && STATUS_ALLOW_OCCUPANTS_VARIANT_FALLBACK.has(lastError.status)) {
@@ -715,6 +812,10 @@ export class SalusCloudClient {
       if (!shouldSwitchToLegacyApi(error)) {
         throw error;
       }
+
+      this.blockModernDeviceShadows(
+        `Salus cloud denied direct property sync for ${dsn} (${asErrorMessage(error)}).`,
+      );
       const cachedAfterFailure = this.propertyCacheByDsn.get(dsn);
       if (cachedAfterFailure) {
         if (this.verboseLogging) {
@@ -723,31 +824,19 @@ export class SalusCloudClient {
         return cachedAfterFailure;
       }
 
-      if (!this.blockedPropertyShadowDsns.has(dsn)) {
-        this.blockedPropertyShadowDsns.add(dsn);
-        this.log.warn(
-          `Salus cloud denied direct property sync for ${dsn} (${asErrorMessage(error)}).`
-          + ' Continuing discovery using available occupants/device payload data.',
-        );
-      }
-
       return new Map();
     }
   }
 
   private async listPropertiesModern(dsn: string): Promise<SalusPropertyMap> {
-    if (this.skipModernDeviceShadows) {
-      return this.propertyCacheByDsn.get(dsn) ?? new Map();
-    }
-
-    if (this.blockedPropertyShadowDsns.has(dsn)) {
+    if (this.isModernDeviceShadowBlocked()) {
       return this.propertyCacheByDsn.get(dsn) ?? new Map();
     }
 
     const shadows = await this.fetchDeviceShadows([], [dsn]);
+    this.unblockModernDeviceShadows();
     const fromFetch = shadows.get(dsn);
     if (fromFetch) {
-      this.blockedPropertyShadowDsns.delete(dsn);
       this.propertyCacheByDsn.set(dsn, fromFetch);
       return fromFetch;
     }
@@ -959,8 +1048,10 @@ export class SalusCloudClient {
     this.authRequestInFlight = null;
     this.hasWarnedAboutAuthCompanyCode = false;
     this.hasEstablishedModernAuthContext = false;
-    this.skipModernDeviceShadows = false;
+    this.blockedModernDeviceShadowUntilEpochMs = 0;
     this.hasWarnedAboutDeviceShadowAuthFailure = false;
+    this.blockedSliderDetailsTargets.clear();
+    this.blockedAllSliderDetailsUntilEpochMs = 0;
 
     if (!this.hasWarnedAboutLegacyFallback) {
       this.hasWarnedAboutLegacyFallback = true;
@@ -1012,6 +1103,102 @@ export class SalusCloudClient {
     }
   }
 
+  private getActiveBlockedSliderDetailsTargetCount(): number {
+    const now = Date.now();
+    for (const [targetKey, expiresAt] of this.blockedSliderDetailsTargets) {
+      if (expiresAt <= now) {
+        this.blockedSliderDetailsTargets.delete(targetKey);
+      }
+    }
+    return this.blockedSliderDetailsTargets.size;
+  }
+
+  private isSliderDetailsTargetBlocked(targetKey: string): boolean {
+    const expiresAt = this.blockedSliderDetailsTargets.get(targetKey);
+    if (!expiresAt) {
+      return false;
+    }
+    if (expiresAt <= Date.now()) {
+      this.blockedSliderDetailsTargets.delete(targetKey);
+      return false;
+    }
+    return true;
+  }
+
+  private blockSliderDetailsTarget(targetKey: string): void {
+    this.blockedSliderDetailsTargets.set(targetKey, Date.now() + SLIDER_DETAILS_BLOCK_TTL_MS);
+  }
+
+  private unblockSliderDetailsTarget(targetKey: string): void {
+    this.blockedSliderDetailsTargets.delete(targetKey);
+  }
+
+  private isAllSliderDetailsBlocked(): boolean {
+    if (this.blockedAllSliderDetailsUntilEpochMs <= 0) {
+      return false;
+    }
+    if (this.blockedAllSliderDetailsUntilEpochMs <= Date.now()) {
+      this.blockedAllSliderDetailsUntilEpochMs = 0;
+      this.hasWarnedAboutSliderDetailsAuthFailure = false;
+      if (this.verboseLogging) {
+        this.log.debug('Retrying /occupants/slider_details after authorization cooldown.');
+      }
+      return false;
+    }
+    return true;
+  }
+
+  private blockAllSliderDetails(): void {
+    this.blockedAllSliderDetailsUntilEpochMs = Date.now() + SLIDER_DETAILS_BLOCK_TTL_MS;
+  }
+
+  private unblockAllSliderDetails(): void {
+    this.blockedAllSliderDetailsUntilEpochMs = 0;
+    this.hasWarnedAboutSliderDetailsAuthFailure = false;
+  }
+
+  private isModernDeviceShadowBlocked(): boolean {
+    if (this.blockedModernDeviceShadowUntilEpochMs <= 0) {
+      return false;
+    }
+    if (this.blockedModernDeviceShadowUntilEpochMs <= Date.now()) {
+      this.blockedModernDeviceShadowUntilEpochMs = 0;
+      this.hasWarnedAboutDeviceShadowAuthFailure = false;
+      if (this.verboseLogging) {
+        this.log.debug('Retrying devices/device_shadows after authorization cooldown.');
+      }
+      return false;
+    }
+    return true;
+  }
+
+  private blockModernDeviceShadows(reason: string): void {
+    const wasBlocked = this.isModernDeviceShadowBlocked();
+    this.blockedModernDeviceShadowUntilEpochMs = Date.now() + DEVICE_SHADOW_BLOCK_TTL_MS;
+    if (!this.hasWarnedAboutDeviceShadowAuthFailure) {
+      this.hasWarnedAboutDeviceShadowAuthFailure = true;
+      this.log.info(
+        `${reason} Continuing sync with inline occupants/devices payload properties only for`
+        + ` ${Math.round(DEVICE_SHADOW_BLOCK_TTL_MS / 60_000)} minutes before retrying.`,
+      );
+    } else if (this.verboseLogging && !wasBlocked) {
+      this.log.debug(
+        `Blocked devices/device_shadows for ${Math.round(DEVICE_SHADOW_BLOCK_TTL_MS / 60_000)} minutes (${reason})`,
+      );
+    }
+  }
+
+  private unblockModernDeviceShadows(): void {
+    if (this.blockedModernDeviceShadowUntilEpochMs <= 0) {
+      return;
+    }
+    this.blockedModernDeviceShadowUntilEpochMs = 0;
+    this.hasWarnedAboutDeviceShadowAuthFailure = false;
+    if (this.verboseLogging) {
+      this.log.debug('devices/device_shadows authorization recovered; direct shadow sync re-enabled.');
+    }
+  }
+
   private rememberLastKnownDevices(devices: SalusDevice[]): void {
     this.lastKnownDevices = devices.map((device) => ({ ...device }));
   }
@@ -1039,7 +1226,9 @@ export class SalusCloudClient {
 
     const severeDropThreshold = Math.max(1, Math.floor(previous.length * 0.8));
     const severeDropDetected = devices.length <= severeDropThreshold;
-    const authRestrictedDiscovery = this.hasWarnedAboutSliderDetailsAuthFailure || this.skipModernDeviceShadows;
+    const authRestrictedDiscovery = this.getActiveBlockedSliderDetailsTargetCount() > 0
+      || this.isAllSliderDetailsBlocked()
+      || this.isModernDeviceShadowBlocked();
     if (!severeDropDetected || !authRestrictedDiscovery) {
       this.hasWarnedAboutPartialDiscoveryFallback = false;
       return devices;
@@ -1062,16 +1251,25 @@ export class SalusCloudClient {
     const dsns = [...new Set((preferredDsns ?? devices.map((device) => device.dsn)).filter((value) => value.trim() !== ''))];
     const ids = [...new Set(devices.map((device) => device.id).filter((value) => value.trim() !== ''))];
     const keys = [...new Set(devices.map((device) => device.key).filter((value): value is string => Boolean(value && value.trim() !== '')))];
+    const hasExplicitPreferredDsns = Array.isArray(preferredDsns) && preferredDsns.length > 0;
 
-    const variants: ShadowRequestVariant[] = [
-      {
+    const variants: ShadowRequestVariant[] = [];
+
+    if (!hasExplicitPreferredDsns) {
+      variants.push({
         method: 'GET',
         path: '/devices/device_shadows',
         description: 'GET /devices/device_shadows',
-      },
-    ];
+      });
+    }
 
     if (dsns.length > 0) {
+      variants.push({
+        method: 'POST',
+        path: '/devices/device_shadows',
+        body: { device_codes: dsns },
+        description: 'POST /devices/device_shadows {device_codes}',
+      });
       variants.push({
         method: 'GET',
         path: `/devices/device_shadows?dsns=${encodeURIComponent(dsns.join(','))}`,
@@ -1115,6 +1313,14 @@ export class SalusCloudClient {
       });
     }
 
+    if (hasExplicitPreferredDsns) {
+      variants.push({
+        method: 'GET',
+        path: '/devices/device_shadows',
+        description: 'GET /devices/device_shadows',
+      });
+    }
+
     const orderedVariants = prioritizeByDescription(variants, this.preferredShadowVariantDescription);
     let lastRecoverableError: unknown;
 
@@ -1126,6 +1332,10 @@ export class SalusCloudClient {
             method: variant.method,
             body: variant.body,
             auth: true,
+            allow401Refresh: false,
+            allowCompanyCodeRotation: false,
+            activeServiceBaseOnly: true,
+            maxAttempts: 1,
           },
         );
 
@@ -1785,7 +1995,8 @@ export class SalusCloudClient {
     }
 
     const expectedStatuses = options.expectedStatuses ?? DEFAULT_EXPECTED_STATUSES;
-    const totalAttempts = this.maxRetries + 1;
+    const configuredAttempts = options.maxAttempts ?? (this.maxRetries + 1);
+    const totalAttempts = Math.max(1, Math.floor(configuredAttempts));
 
     let hasRefreshedSessionAfter401 = false;
     const attemptedCompanyCodes = new Set<string>([companyCodeCandidateKey(this.activeCompanyCode)]);
@@ -1793,7 +2004,9 @@ export class SalusCloudClient {
     let lastError: unknown = new Error(`No Salus cloud response received for ${options.method} ${path}`);
 
     for (let attempt = 1; attempt <= totalAttempts; attempt++) {
-      const orderedBaseUrls = this.getOrderedServiceApiBaseUrls();
+      const orderedBaseUrls = options.activeServiceBaseOnly
+        ? (this.activeServiceApiBaseUrl ? [this.activeServiceApiBaseUrl] : this.getOrderedServiceApiBaseUrls())
+        : this.getOrderedServiceApiBaseUrls();
       let sawRetriableFailure = false;
       let sawDefinitiveFailure = false;
       let definitiveError: unknown;
@@ -1820,9 +2033,10 @@ export class SalusCloudClient {
             const responseCode = extractServiceResponseCode(responseText);
             const hintedCompanyCode = extractCompanyCodeFromServiceAuthError(responseText);
             const isCompanyCodeMismatch = responseCode === '900008';
-            const allowCompanyCodeRotation = !this.hasEstablishedModernAuthContext;
+            const allowCompanyCodeRotation = (options.allowCompanyCodeRotation ?? true)
+              && !this.hasEstablishedModernAuthContext;
 
-            if (isCompanyCodeMismatch && !this.hasWarnedAboutAuthCompanyCode) {
+            if (isCompanyCodeMismatch && allowCompanyCodeRotation && !this.hasWarnedAboutAuthCompanyCode) {
               this.hasWarnedAboutAuthCompanyCode = true;
               this.log.warn(
                 'Salus cloud returned response_code=900008 (Not authorized). This often indicates tenant/company authorization context mismatch.',
@@ -1880,8 +2094,21 @@ export class SalusCloudClient {
               responseText,
             );
             lastError = unauthorizedError;
-            sawRetriableFailure = true;
-            lastRetriableError = unauthorizedError;
+            if (options.allow401Refresh ?? true) {
+              sawRetriableFailure = true;
+              lastRetriableError = unauthorizedError;
+            } else {
+              sawDefinitiveFailure = true;
+              if (!definitiveError) {
+                definitiveError = unauthorizedError;
+              }
+              // For discovery sub-endpoints where both session refresh and company-code
+              // rotation are intentionally disabled, retrying all base hosts on 401
+              // only adds latency and request noise. Fail fast.
+              if (!(options.allowCompanyCodeRotation ?? true)) {
+                break;
+              }
+            }
             continue;
           }
 
@@ -2031,8 +2258,15 @@ export class SalusCloudClient {
               responseText,
             );
             lastError = unauthorizedError;
-            sawRetriableFailure = true;
-            lastRetriableError = unauthorizedError;
+            if (options.allow401Refresh ?? true) {
+              sawRetriableFailure = true;
+              lastRetriableError = unauthorizedError;
+            } else {
+              sawDefinitiveFailure = true;
+              if (!definitiveError) {
+                definitiveError = unauthorizedError;
+              }
+            }
             continue;
           }
 
@@ -2215,7 +2449,7 @@ export class SalusCloudClient {
     const baseDelay = Math.min(MAX_RETRY_DELAY_MS, this.retryBaseDelayMs * (2 ** (attempt - 1)));
     const jitter = 0.85 + (Math.random() * 0.3);
     const delayMs = Math.max(250, Math.round(baseDelay * jitter));
-    this.log.warn(`Retrying Salus cloud request in ${delayMs}ms (attempt ${attempt + 1}/${this.maxRetries + 1}): ${reason}`);
+    this.log.info(`Retrying Salus cloud request in ${delayMs}ms (attempt ${attempt + 1}/${this.maxRetries + 1}): ${reason}`);
     await sleep(delayMs);
   }
 
@@ -2290,15 +2524,18 @@ function buildServiceApiBaseCandidates(
     ? [
       DEFAULT_US_SERVICE_API_HOST,
       FALLBACK_US_SERVICE_API_HOST,
-      DEFAULT_EU_SERVICE_API_HOST,
-      FALLBACK_EU_SERVICE_API_HOST,
     ]
-    : [
-      DEFAULT_EU_SERVICE_API_HOST,
-      FALLBACK_EU_SERVICE_API_HOST,
-      DEFAULT_US_SERVICE_API_HOST,
-      FALLBACK_US_SERVICE_API_HOST,
-    ];
+    : region === 'eu'
+      ? [
+        DEFAULT_EU_SERVICE_API_HOST,
+        FALLBACK_EU_SERVICE_API_HOST,
+      ]
+      : [
+        DEFAULT_EU_SERVICE_API_HOST,
+        FALLBACK_EU_SERVICE_API_HOST,
+        DEFAULT_US_SERVICE_API_HOST,
+        FALLBACK_US_SERVICE_API_HOST,
+      ];
 
   return dedupeStringArray(hosts.flatMap((host) => buildApiVersionCandidates(host, versionPreference)));
 }
@@ -2311,11 +2548,14 @@ function buildLegacyApiBaseCandidates(
   if (normalizedOverride) {
     const overrideCandidates = deriveLegacyHostCandidatesFromOverride(normalizedOverride);
     if (overrideCandidates.length > 0) {
+      const regionalFallback = region === 'us'
+        ? [DEFAULT_US_LEGACY_API_HOST, FALLBACK_US_LEGACY_API_HOST]
+        : region === 'eu'
+          ? [DEFAULT_EU_LEGACY_API_HOST, FALLBACK_EU_LEGACY_API_HOST]
+          : [DEFAULT_EU_LEGACY_API_HOST, FALLBACK_EU_LEGACY_API_HOST, DEFAULT_US_LEGACY_API_HOST, FALLBACK_US_LEGACY_API_HOST];
       const withFallback = [
         ...overrideCandidates,
-        ...(region === 'us'
-          ? [DEFAULT_US_LEGACY_API_HOST, FALLBACK_US_LEGACY_API_HOST, DEFAULT_EU_LEGACY_API_HOST, FALLBACK_EU_LEGACY_API_HOST]
-          : [DEFAULT_EU_LEGACY_API_HOST, FALLBACK_EU_LEGACY_API_HOST, DEFAULT_US_LEGACY_API_HOST, FALLBACK_US_LEGACY_API_HOST]),
+        ...regionalFallback,
       ];
       return dedupeStringArray(withFallback.map((value) => normalizeUrl(value)));
     }
@@ -2325,15 +2565,18 @@ function buildLegacyApiBaseCandidates(
     ? [
       DEFAULT_US_LEGACY_API_HOST,
       FALLBACK_US_LEGACY_API_HOST,
-      DEFAULT_EU_LEGACY_API_HOST,
-      FALLBACK_EU_LEGACY_API_HOST,
     ]
-    : [
-      DEFAULT_EU_LEGACY_API_HOST,
-      FALLBACK_EU_LEGACY_API_HOST,
-      DEFAULT_US_LEGACY_API_HOST,
-      FALLBACK_US_LEGACY_API_HOST,
-    ];
+    : region === 'eu'
+      ? [
+        DEFAULT_EU_LEGACY_API_HOST,
+        FALLBACK_EU_LEGACY_API_HOST,
+      ]
+      : [
+        DEFAULT_EU_LEGACY_API_HOST,
+        FALLBACK_EU_LEGACY_API_HOST,
+        DEFAULT_US_LEGACY_API_HOST,
+        FALLBACK_US_LEGACY_API_HOST,
+      ];
 
   return dedupeStringArray(hosts.map((value) => normalizeUrl(value)));
 }
@@ -2887,7 +3130,7 @@ function buildSliderDetailsPathGroups(targetId: string, typeHints: string[]): st
   const orderedTypes = dedupeStringArray([
     ...normalizedHints,
     ...OCCUPANTS_SLIDER_DETAIL_TYPE_FALLBACKS,
-  ]);
+  ]).slice(0, MAX_OCCUPANTS_DETAIL_TYPES_PER_TARGET);
 
   const groups: string[][] = [];
   for (const type of orderedTypes) {
@@ -2904,16 +3147,6 @@ function buildSliderDetailsPathGroups(targetId: string, typeHints: string[]): st
   ]);
 
   return groups;
-}
-
-function sliderTargetKey(target: OccupantsSliderTarget): string {
-  const normalizedHints = dedupeStringArray(
-    target.typeHints
-      .map((value) => normalizeSliderType(value))
-      .filter((value): value is string => Boolean(value))
-      .sort(),
-  );
-  return `${target.id}::${normalizedHints.join(',')}`;
 }
 
 function parseDevices(payload: unknown): SalusDevice[] {
@@ -3005,22 +3238,10 @@ function parseDeviceRecord(record: Record<string, unknown>): SalusDevice | undef
     ?? asString(record.unique_hardware_id)
     ?? asString(record.uniqueHardwareId),
   );
-  const id = normalizeNonEmptyString(
-    asString(record.id)
-    ?? asString(record.device_id)
-    ?? asString(record.node_id)
-    ?? key
-    ?? explicitDsn,
+  const fallbackIdentity = normalizeNonEmptyString(
+    asString(record.device_id)
+    ?? asString(record.node_id),
   );
-  const dsn = explicitDsn ?? key ?? id;
-
-  if (!dsn || !id) {
-    return undefined;
-  }
-  if (!explicitDsn && !looksLikeDeviceRecord(record)) {
-    return undefined;
-  }
-
   const modelRaw = asString(record.oem_model)
     ?? asString(record.model)
     ?? asString(record.model_name)
@@ -3028,6 +3249,41 @@ function parseDeviceRecord(record: Record<string, unknown>): SalusDevice | undef
     ?? asString(record.device_model)
     ?? asString(record.product_name)
     ?? '';
+  const hasModelHint = Boolean(normalizeNonEmptyString(modelRaw));
+  const hasStatePayload = recordHasStatePayload(record);
+  const hasStrongIdentity = recordHasStrongDeviceIdentity(record);
+
+  const id = normalizeNonEmptyString(
+    asString(record.id)
+    ?? asString(record.device_id)
+    ?? asString(record.node_id)
+    ?? key
+    ?? explicitDsn,
+  );
+  let dsn = explicitDsn ?? key;
+  if (!dsn && fallbackIdentity) {
+    // Some tenants expose device_id/node_id without dsn/device_key.
+    // Accept this fallback only when the record also carries device-like
+    // model/state payloads, avoiding synthetic accessories for container rows.
+    if (normalizeNonEmptyString(modelRaw) || recordHasStatePayload(record)) {
+      dsn = fallbackIdentity;
+    }
+  }
+
+  if (!dsn || !id) {
+    return undefined;
+  }
+  if (!explicitDsn && !key && !fallbackIdentity) {
+    return undefined;
+  }
+  if (!hasStrongIdentity && !hasModelHint && !hasStatePayload) {
+    // Ignore synthetic rows such as automation/rule/status records that expose
+    // only generic keys/names without real device identity or state payload.
+    return undefined;
+  }
+  if (!looksLikeDeviceRecord(record)) {
+    return undefined;
+  }
 
   const model = normalizeModelName(modelRaw);
   const displayName = deriveDeviceDisplayName(record, dsn, model);
@@ -3046,10 +3302,8 @@ function parseDeviceRecord(record: Record<string, unknown>): SalusDevice | undef
 }
 
 function looksLikeDeviceRecord(record: Record<string, unknown>): boolean {
-  if (recordHasDeviceIdentity(record)) {
-    return true;
-  }
-
+  const hasStrongIdentity = recordHasStrongDeviceIdentity(record);
+  const hasAnyIdentity = recordHasDeviceIdentity(record);
   const modelHints = [
     record.oem_model,
     record.model,
@@ -3057,21 +3311,27 @@ function looksLikeDeviceRecord(record: Record<string, unknown>): boolean {
     record.product_class,
     record.device_model,
   ];
-  if (modelHints.some((value) => normalizeNonEmptyString(asString(value)))) {
+  const hasModelHint = modelHints.some((value) => normalizeNonEmptyString(asString(value)));
+  const hasStatePayload = recordHasStatePayload(record);
+
+  if (hasStrongIdentity && (hasModelHint || hasStatePayload || 'device_name' in record || 'product_name' in record)) {
     return true;
   }
 
+  if (hasAnyIdentity && (hasModelHint || hasStatePayload)) {
+    return true;
+  }
+
+  return false;
+}
+
+function recordHasStatePayload(record: Record<string, unknown>): boolean {
   const stateHints = ['shadow', 'device_shadow', 'properties', 'property_values', 'datapoints', 'reported', 'desired', 'state'];
   for (const key of stateHints) {
     if (key in record) {
       return true;
     }
   }
-
-  if ('device_name' in record || 'product_name' in record) {
-    return true;
-  }
-
   return false;
 }
 
@@ -3090,6 +3350,27 @@ function recordHasDeviceIdentity(record: Record<string, unknown>): boolean {
   ];
 
   return idHints.some((value) => normalizeNonEmptyString(asString(value)));
+}
+
+function recordHasStrongDeviceIdentity(record: Record<string, unknown>): boolean {
+  const strongHints = [
+    record.dsn,
+    record.device_dsn,
+    record.device_code,
+    record.DSN,
+    record.unique_hardware_id,
+    record.uniqueHardwareId,
+    record.device_id,
+    record.node_id,
+    record.serial_number,
+    record.serialNumber,
+    record.mac_address,
+    record.mac,
+    record.ieee_address,
+    record.ieee,
+  ];
+
+  return strongHints.some((value) => normalizeNonEmptyString(asString(value)));
 }
 
 function parseDeviceShadows(
@@ -3123,7 +3404,7 @@ function parseDeviceShadows(
     const dsn = inferShadowDsn(record, deviceIdToDsn, deviceKeyToDsn);
 
     if (dsn) {
-      const propertyCandidates = [
+      const propertyCandidates: unknown[] = [
         record.shadow,
         record.device_shadow,
         record.properties,
@@ -3131,9 +3412,11 @@ function parseDeviceShadows(
         record.datapoints,
         record.reported,
         record.desired,
+        record.delta,
         record.state,
         record.attrs,
       ];
+      propertyCandidates.push(...collectEmbeddedShadowPropertyCandidates(record));
 
       const merged = new Map<string, SalusProperty>();
       for (const candidate of propertyCandidates) {
@@ -3165,6 +3448,106 @@ function parseDeviceShadows(
   }
 
   return output;
+}
+
+function collectEmbeddedShadowPropertyCandidates(record: Record<string, unknown>): unknown[] {
+  const candidates: unknown[] = [];
+  const queue: unknown[] = [
+    record.payload,
+    record.shadow_payload,
+    record.shadowPayload,
+    record.state,
+    record.reported,
+    record.desired,
+    record.delta,
+    record.shadow,
+    record.device_shadow,
+    record.properties,
+    record.property_values,
+    record.datapoints,
+    record.attrs,
+    record.data,
+    record.value,
+  ];
+  const visited = new Set<unknown>();
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (current === undefined || current === null) {
+      continue;
+    }
+
+    if (typeof current === 'string') {
+      const parsed = parseJsonRecord(current);
+      if (parsed) {
+        queue.push(parsed);
+      }
+      continue;
+    }
+
+    if (typeof current !== 'object') {
+      continue;
+    }
+    if (visited.has(current)) {
+      continue;
+    }
+    visited.add(current);
+
+    if (Array.isArray(current)) {
+      for (const entry of current) {
+        queue.push(entry);
+      }
+      continue;
+    }
+
+    const currentRecord = current as Record<string, unknown>;
+    candidates.push(currentRecord);
+
+    const propertyMaps = [
+      asRecord(currentRecord.properties),
+      asRecord(currentRecord.attrs),
+      asRecord(currentRecord.shadow),
+      asRecord(currentRecord.device_shadow),
+      asRecord(currentRecord.property_values),
+      asRecord(currentRecord.datapoints),
+    ]
+      .filter((value): value is Record<string, unknown> => Boolean(value));
+    for (const propertyMap of propertyMaps) {
+      candidates.push(propertyMap);
+      queue.push(propertyMap);
+    }
+
+    const stateRecord = asRecord(currentRecord.state);
+    if (stateRecord) {
+      candidates.push(stateRecord);
+      queue.push(stateRecord.reported);
+      queue.push(stateRecord.desired);
+      queue.push(stateRecord.delta);
+      queue.push(stateRecord.properties);
+    }
+
+    queue.push(currentRecord.reported);
+    queue.push(currentRecord.desired);
+    queue.push(currentRecord.delta);
+    queue.push(currentRecord.data);
+    queue.push(currentRecord.value);
+
+    for (const value of Object.values(currentRecord)) {
+      if (typeof value === 'string') {
+        // Some APIs return nested state snapshots as serialized JSON strings.
+        const parsed = parseJsonRecord(value);
+        if (parsed) {
+          queue.push(parsed);
+        }
+        continue;
+      }
+      if (value && typeof value === 'object') {
+        queue.push(value);
+      }
+    }
+  }
+
+  return candidates;
 }
 
 function inferShadowDsn(
@@ -3268,7 +3651,7 @@ function parseProperties(payload: unknown): SalusPropertyMap {
 
 function parsePropertyObjectMap(record: Record<string, unknown>, output: SalusPropertyMap): void {
   for (const [name, rawValue] of Object.entries(record)) {
-    if (METADATA_FIELD_NAMES.has(name)) {
+    if (isMetadataFieldName(name)) {
       continue;
     }
 
@@ -3302,6 +3685,9 @@ function parsePropertyEntry(entry: unknown): SalusProperty | undefined {
     ?? asString(node.property_name)
     ?? asString(node.key);
   if (!name) {
+    return undefined;
+  }
+  if (isMetadataFieldName(name)) {
     return undefined;
   }
 
@@ -3411,11 +3797,31 @@ function looksLikePropertyName(name: string, rawValue: unknown): boolean {
     return false;
   }
 
-  if (name.includes(':')) {
+  if (isMetadataFieldName(name)) {
+    return false;
+  }
+
+  if (name.includes(':') || name.includes('.') || name.includes('/')) {
     return true;
   }
 
-  if (/^[A-Za-z][A-Za-z0-9_]+$/.test(name) && /[A-Z_]/.test(name)) {
+  if (/^[A-Za-z][A-Za-z0-9_]+$/.test(name) && /[A-Z]/.test(name)) {
+    return true;
+  }
+
+  if (/_x\d+$/i.test(name)) {
+    return true;
+  }
+
+  const record = asRecord(rawValue);
+  if (record && (
+    'value' in record
+    || 'current_value' in record
+    || 'datapoint' in record
+    || 'last_datapoint' in record
+    || 'reported' in record
+    || 'desired' in record
+  )) {
     return true;
   }
 
@@ -3434,6 +3840,10 @@ function looksLikePropertyName(name: string, rawValue: unknown): boolean {
   }
 
   return false;
+}
+
+function isMetadataFieldName(name: string): boolean {
+  return METADATA_FIELD_NAMES.has(name) || METADATA_FIELD_NAMES_LOWER.has(name.toLowerCase());
 }
 
 function deriveDeviceDisplayName(record: Record<string, unknown>, dsn: string, model: string): string {
