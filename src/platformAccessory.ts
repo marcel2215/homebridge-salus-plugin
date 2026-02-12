@@ -201,6 +201,7 @@ export class SalusPlatformAccessory {
   private writeTargets: WriteTargets = {};
   private cachedTargetState = 0;
   private cachedSystemMode = SALUS_MODE.auto;
+  private thermostatSetpointWriteSequence = 0;
 
   constructor(
     private readonly platform: SalusHomebridgePlatform,
@@ -781,6 +782,8 @@ export class SalusPlatformAccessory {
     }
 
     const targetTemperature = clamp(numericValue, 4.5, 35);
+    const writeSequence = ++this.thermostatSetpointWriteSequence;
+
     const setpointProperty = this.firstDefined(
       this.writeTargets.heatSetpoint,
       this.writeTargets.autoHeatSetpoint,
@@ -807,13 +810,22 @@ export class SalusPlatformAccessory {
     }
 
     await this.platform.writeDeviceProperties(this.device, writes);
-    await this.ensureThermostatTargetApplied(targetTemperature);
+    const confirmation = await this.ensureThermostatTargetApplied(targetTemperature, writeSequence);
+    if (confirmation === 'superseded') {
+      this.platform.log.debug(
+        `Skipped outdated thermostat confirmation for ${this.device.name}; a newer target write is in progress.`,
+      );
+      return;
+    }
     this.cachedTargetState = this.platform.Characteristic.TargetHeatingCoolingState.HEAT;
     this.cachedSystemMode = SALUS_MODE.heat;
     this.platform.log.info(`Set thermostat target for ${this.device.name} to ${targetTemperature.toFixed(1)}°C`);
   }
 
-  private async ensureThermostatTargetApplied(expectedTemperatureC: number): Promise<void> {
+  private async ensureThermostatTargetApplied(
+    expectedTemperatureC: number,
+    writeSequence: number,
+  ): Promise<'applied' | 'superseded'> {
     const maxAttempts = 10;
     const toleranceC = 0.4;
     let lastObserved: number | undefined;
@@ -822,6 +834,9 @@ export class SalusPlatformAccessory {
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (writeSequence !== this.thermostatSetpointWriteSequence) {
+        return 'superseded';
+      }
       try {
         const properties = await this.platform.readDeviceProperties(this.device);
         const primaryObserved = getNumberProperty(properties, THERMOSTAT_HEAT_SETPOINT_EFFECTIVE);
@@ -842,7 +857,7 @@ export class SalusPlatformAccessory {
 
         const primaryMatches = primaryC !== undefined && Math.abs(primaryC - expectedTemperatureC) <= toleranceC;
         if (primaryMatches) {
-          return;
+          return 'applied';
         }
       } catch (error) {
         lastError = error;

@@ -11,9 +11,11 @@ import type { DeviceProfile, PlatformAccessoryContext, SalusDevice, SalusPlatfor
 
 const DEFAULT_POLL_INTERVAL_SECONDS = 20;
 const DEFAULT_MAX_PARALLEL_PROPERTY_REQUESTS = 4;
+const DEFAULT_FULL_DISCOVERY_INTERVAL_SECONDS = 300;
 const MIN_POLL_INTERVAL_SECONDS = 10;
 const MAX_POLL_INTERVAL_SECONDS = 300;
 const STALE_ACCESSORY_REMOVAL_GRACE_POLLS = 3;
+const POLL_BUSY_LOG_THROTTLE_MS = 30_000;
 
 const THERMOSTAT_PROPERTY_BASES = [
   'HeatingSetpoint_x100',
@@ -153,10 +155,14 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
   private readonly configTyped: SalusPlatformConfig;
   private readonly cloudClient: SalusCloudClient | null;
   private readonly pollIntervalMs: number;
+  private readonly fullDiscoveryIntervalMs: number;
   private readonly maxParallelPropertyRequests: number;
   private readonly missingAccessoryPollCounts: Map<string, number> = new Map();
   private pollTimer: NodeJS.Timeout | null = null;
   private pollInProgress = false;
+  private pollRequestedWhileBusy = false;
+  private lastBusyPollLogEpochMs = 0;
+  private lastFullDiscoveryEpochMs = 0;
   private launchCompleted = false;
   private hasLoggedDuplicateRegisterWorkaround = false;
 
@@ -176,6 +182,10 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
     this.maxParallelPropertyRequests = Math.max(
       1,
       Math.floor(this.configTyped.maxParallelPropertyRequests ?? DEFAULT_MAX_PARALLEL_PROPERTY_REQUESTS),
+    );
+    this.fullDiscoveryIntervalMs = Math.max(
+      this.pollIntervalMs,
+      Math.round((DEFAULT_FULL_DISCOVERY_INTERVAL_SECONDS) * 1_000),
     );
 
     if (!this.configTyped.email || !this.configTyped.password) {
@@ -267,8 +277,12 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
       return;
     }
     if (this.pollInProgress) {
-      this.log.info('Previous Salus poll is still in progress; delaying next cycle.');
-      this.schedulePoll(2_000);
+      this.pollRequestedWhileBusy = true;
+      const now = Date.now();
+      if ((now - this.lastBusyPollLogEpochMs) >= POLL_BUSY_LOG_THROTTLE_MS) {
+        this.lastBusyPollLogEpochMs = now;
+        this.log.info('Previous Salus poll is still in progress; queued one immediate follow-up poll.');
+      }
       return;
     }
 
@@ -276,7 +290,24 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
     const discoveredUuids = new Set<string>();
 
     try {
-      const devices = await this.cloudClient.listDevices();
+      const now = Date.now();
+      const knownDevices = this.cloudClient.getKnownDevicesSnapshot();
+      const runFullDiscovery = knownDevices.length === 0
+        || (now - this.lastFullDiscoveryEpochMs) >= this.fullDiscoveryIntervalMs;
+
+      let devices: SalusDevice[];
+      if (runFullDiscovery) {
+        devices = await this.cloudClient.listDevices();
+        this.lastFullDiscoveryEpochMs = Date.now();
+      } else {
+        await this.cloudClient.refreshKnownDeviceShadows();
+        devices = this.cloudClient.getKnownDevicesSnapshot();
+        if (devices.length === 0) {
+          devices = await this.cloudClient.listDevices();
+          this.lastFullDiscoveryEpochMs = Date.now();
+        }
+      }
+
       const dedupedByDsn = dedupeDevicesByDsn(devices)
         .filter((device) => !shouldIgnoreInfrastructureDevice(device))
         .map((device) => ({ ...device, name: sanitizeHomeKitName(device.name, device.model || device.dsn) }));
@@ -290,7 +321,10 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
         this.maxParallelPropertyRequests,
         async (device) => {
           try {
-            const properties = await this.cloudClient!.listProperties(device.dsn);
+            const cached = this.cloudClient!.getCachedProperties(device.dsn);
+            const properties = (cached && cached.size > 0)
+              ? cached
+              : await this.cloudClient!.listProperties(device.dsn);
             const normalizedDevice = normalizeDeviceOnlineState(device, properties);
             const profile = this.deriveProfile(normalizedDevice, properties);
             return { device: normalizedDevice, properties, profile };
@@ -329,7 +363,12 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
       this.log.error(`Salus sync failed: ${asErrorMessage(error)}`);
     } finally {
       this.pollInProgress = false;
-      this.schedulePoll(this.pollIntervalMs);
+      if (this.pollRequestedWhileBusy) {
+        this.pollRequestedWhileBusy = false;
+        this.schedulePoll(0);
+      } else {
+        this.schedulePoll(this.pollIntervalMs);
+      }
     }
   }
 

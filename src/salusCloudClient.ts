@@ -114,7 +114,6 @@ class OccupantsDiscoveryEmptyError extends Error {
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_BASE_DELAY_MS = 750;
 const MAX_RETRY_DELAY_MS = 60_000;
-const MAX_PREFERRED_WRITE_CACHE_SIZE = 2_000;
 const DEFAULT_COGNITO_REGION = 'eu-central-1';
 const DEFAULT_COGNITO_CLIENT_ID = '4pk5efh3v84g5dav43imsv4fbj';
 const DEFAULT_COGNITO_USER_POOL_ID = 'eu-central-1_XGRz3CgoY';
@@ -317,7 +316,6 @@ export class SalusCloudClient {
   private hasEstablishedModernAuthContext = false;
   private lastKnownDevices: SalusDevice[] = [];
   private preferredShadowVariantDescription: string | null = null;
-  private readonly preferredWriteAttemptByKey: Map<string, string> = new Map();
   private insecureTlsInFlight = 0;
   private insecureTlsPreviousValue: string | undefined;
   private insecureTlsHadPreviousValue = false;
@@ -378,6 +376,45 @@ export class SalusCloudClient {
 
   public getCachedProperties(dsn: string): SalusPropertyMap | undefined {
     return this.propertyCacheByDsn.get(dsn);
+  }
+
+  public getKnownDevicesSnapshot(): SalusDevice[] {
+    return this.getLastKnownDevicesSnapshot();
+  }
+
+  public async refreshKnownDeviceShadows(): Promise<void> {
+    const knownDevices = this.getLastKnownDevicesSnapshot();
+    if (knownDevices.length === 0) {
+      return;
+    }
+    if (this.apiTransportMode === 'legacy') {
+      return;
+    }
+    if (this.isModernDeviceShadowBlocked()) {
+      return;
+    }
+
+    try {
+      const shadows = await this.fetchDeviceShadows(knownDevices);
+      this.unblockModernDeviceShadows();
+      if (shadows.size > 0) {
+        this.mergeIntoPropertyCache(shadows);
+      }
+    } catch (error) {
+      if (this.shouldDisableModernDeviceShadowQueries(error)) {
+        this.blockModernDeviceShadows(
+          `Salus cloud denied devices/device_shadows during fast refresh (${asErrorMessage(error)}).`,
+        );
+        return;
+      }
+      if (shouldTryAlternateDiscovery(error) || error instanceof LegacyFallbackRequiredError) {
+        if (this.verboseLogging) {
+          this.log.debug(`Fast shadow refresh degraded (${asErrorMessage(error)}).`);
+        }
+        return;
+      }
+      throw error;
+    }
   }
 
   public async listDevices(): Promise<SalusDevice[]> {
@@ -1013,29 +1050,32 @@ export class SalusCloudClient {
     } catch (error) {
       failures.push(`AWS IoT HTTP shadow update -> ${asErrorMessage(error)}`);
       if (this.verboseLogging) {
-        this.log.debug(`HTTP IoT batch write failed for ${dsn}: ${asErrorMessage(error)}. Falling back to individual write probes.`);
+        this.log.debug(`HTTP IoT batch write failed for ${dsn}: ${asErrorMessage(error)}. Falling back to service-api compatibility write.`);
       }
     }
 
-    for (const [propertyName, value] of Object.entries(properties)) {
-      try {
-        await this.setDatapointModern(dsn, propertyName, value);
-      } catch (error) {
-        failures.push(`${propertyName} -> ${asErrorMessage(error)}`);
-        throw new Error(`Failed to write datapoint batch for ${dsn}. Attempts: ${failures.join(' | ')}`);
+    try {
+      await this.setDatapointsViaServiceApiBulk(dsn, properties);
+      for (const [propertyName, value] of Object.entries(properties)) {
+        this.updateCachedProperty(dsn, propertyName, value);
       }
+      if (this.verboseLogging) {
+        this.log.debug(`Write succeeded via service-api compatibility bulk write for ${dsn}`);
+      }
+      return;
+    } catch (error) {
+      failures.push(`service-api compatibility bulk write -> ${asErrorMessage(error)}`);
+      throw new Error(`Failed to write datapoint batch for ${dsn}. Attempts: ${failures.join(' | ')}`);
     }
   }
 
   private async setDatapointModern(dsn: string, propertyName: string, value: unknown): Promise<void> {
-    const writeCacheKey = `${dsn}:${propertyName}`;
     const failures: string[] = [];
 
     try {
       const mqttAttemptDescription = 'AWS IoT MQTT shadow publish';
       await this.setDatapointsViaAwsIotMqttShadow(dsn, { [propertyName]: value });
       this.updateCachedProperty(dsn, propertyName, value);
-      this.rememberPreferredWriteAttempt(writeCacheKey, mqttAttemptDescription);
       if (this.verboseLogging) {
         this.log.debug(`Write succeeded via ${mqttAttemptDescription}`);
       }
@@ -1051,7 +1091,6 @@ export class SalusCloudClient {
     try {
       await this.setDatapointViaAwsIotShadow(dsn, propertyName, value);
       this.updateCachedProperty(dsn, propertyName, value);
-      this.rememberPreferredWriteAttempt(writeCacheKey, iotAttemptDescription);
       if (this.verboseLogging) {
         this.log.debug(`Write succeeded via ${iotAttemptDescription}`);
       }
@@ -1062,56 +1101,41 @@ export class SalusCloudClient {
         : `${iotAttemptDescription} -> ${asErrorMessage(error)}`;
       failures.push(failureMessage);
       if (this.verboseLogging) {
-        this.log.debug(`AWS IoT write failed for ${dsn}/${propertyName}: ${asErrorMessage(error)}. Falling back to service-api write probes.`);
+        this.log.debug(`AWS IoT write failed for ${dsn}/${propertyName}: ${asErrorMessage(error)}. Falling back to service-api compatibility write.`);
       }
     }
 
-    const preferredAttempt = this.preferredWriteAttemptByKey.get(writeCacheKey) ?? null;
-    const attempts = prioritizeByDescription(this.buildWriteAttempts(dsn, propertyName, value), preferredAttempt);
-    let fatalError: unknown;
-
-    for (const attempt of attempts) {
-      try {
-        await this.requestServiceJson(attempt.path, {
-          method: attempt.method,
-          body: attempt.body,
-          auth: true,
-          expectedStatuses: DEFAULT_EXPECTED_STATUSES,
-        });
-
-        this.updateCachedProperty(dsn, propertyName, value);
-        this.rememberPreferredWriteAttempt(writeCacheKey, attempt.description);
-        if (this.verboseLogging) {
-          this.log.debug(`Write succeeded via ${attempt.description}`);
-        }
-        return;
-      } catch (error) {
-        const failureMessage = error instanceof HttpStatusError
-          ? `${attempt.description} -> HTTP ${error.status}`
-          : `${attempt.description} -> ${asErrorMessage(error)}`;
-        failures.push(failureMessage);
-
-        if (error instanceof HttpStatusError && STATUS_ALLOW_WRITE_SHAPE_FALLBACK.has(error.status)) {
-          continue;
-        }
-        if (error instanceof HttpStatusError && STATUS_ALLOW_PATH_FALLBACK.has(error.status)) {
-          continue;
-        }
-        if (isRetriableFailure(error)) {
-          fatalError = error;
-          break;
-        }
-        fatalError = error;
-        break;
+    try {
+      await this.setDatapointsViaServiceApiBulk(dsn, { [propertyName]: value });
+      this.updateCachedProperty(dsn, propertyName, value);
+      if (this.verboseLogging) {
+        this.log.debug('Write succeeded via service-api compatibility bulk write');
       }
+      return;
+    } catch (error) {
+      failures.push(`service-api compatibility bulk write -> ${asErrorMessage(error)}`);
+      throw new Error(`Failed to write property ${propertyName} on ${dsn}. Attempts: ${failures.join(' | ')}`);
     }
+  }
 
-    if (fatalError) {
-      throw new Error(
-        `Failed to write property ${propertyName} on ${dsn}. Fatal error: ${asErrorMessage(fatalError)}. Attempts: ${failures.join(' | ')}`,
-      );
-    }
-    throw new Error(`Failed to write property ${propertyName} on ${dsn}. Attempts: ${failures.join(' | ')}`);
+  private async setDatapointsViaServiceApiBulk(dsn: string, properties: Record<string, unknown>): Promise<void> {
+    const payload = {
+      devices: [
+        {
+          dsn,
+          properties: Object.entries(properties).map(([name, value]) => ({
+            name,
+            value,
+          })),
+        },
+      ],
+    };
+    await this.requestServiceJson('/devices/bulk', {
+      method: 'POST',
+      body: payload,
+      auth: true,
+      expectedStatuses: DEFAULT_EXPECTED_STATUSES,
+    });
   }
 
   private async setDatapointViaAwsIotShadow(dsn: string, propertyName: string, value: unknown): Promise<void> {
@@ -2024,19 +2048,6 @@ export class SalusCloudClient {
     }
   }
 
-  private rememberPreferredWriteAttempt(cacheKey: string, description: string): void {
-    this.preferredWriteAttemptByKey.delete(cacheKey);
-    this.preferredWriteAttemptByKey.set(cacheKey, description);
-
-    while (this.preferredWriteAttemptByKey.size > MAX_PREFERRED_WRITE_CACHE_SIZE) {
-      const oldestKey = this.preferredWriteAttemptByKey.keys().next().value;
-      if (!oldestKey) {
-        return;
-      }
-      this.preferredWriteAttemptByKey.delete(oldestKey);
-    }
-  }
-
   private rebuildDeviceIndex(devices: SalusDevice[]): void {
     this.deviceIdToDsn.clear();
     this.deviceKeyToDsn.clear();
@@ -2345,155 +2356,6 @@ export class SalusCloudClient {
     }
 
     return new Map();
-  }
-
-  private buildWriteAttempts(dsn: string, propertyName: string, value: unknown): WriteAttempt[] {
-    const deviceId = this.findDeviceIdByDsn(dsn);
-    const deviceKey = this.findDeviceKeyByDsn(dsn);
-    const references: Array<{ description: string; ref: Record<string, string> }> = [
-      { description: 'dsn', ref: { dsn } },
-      { description: 'device_dsn', ref: { device_dsn: dsn } },
-    ];
-    if (deviceId) {
-      references.push({ description: 'device_id', ref: { device_id: deviceId } });
-      references.push({ description: 'id', ref: { id: deviceId } });
-    }
-    if (deviceKey) {
-      references.push({ description: 'device_key', ref: { device_key: deviceKey } });
-      references.push({ description: 'key', ref: { key: deviceKey } });
-    }
-
-    const attempts: WriteAttempt[] = [];
-
-    for (const reference of references) {
-      attempts.push({
-        method: 'POST',
-        path: '/devices/bulk',
-        body: {
-          devices: [
-            {
-              ...reference.ref,
-              shadow: {
-                [propertyName]: value,
-              },
-            },
-          ],
-        },
-        description: `POST /devices/bulk with shadow object (${reference.description})`,
-      });
-
-      attempts.push({
-        method: 'POST',
-        path: '/devices/bulk',
-        body: {
-          devices: [
-            {
-              ...reference.ref,
-              properties: [
-                {
-                  name: propertyName,
-                  value,
-                },
-              ],
-            },
-          ],
-        },
-        description: `POST /devices/bulk with properties[] (${reference.description})`,
-      });
-
-      attempts.push({
-        method: 'POST',
-        path: '/devices/bulk',
-        body: {
-          devices: [
-            {
-              ...reference.ref,
-              datapoints: [
-                {
-                  name: propertyName,
-                  value,
-                },
-              ],
-            },
-          ],
-        },
-        description: `POST /devices/bulk with datapoints[] (${reference.description})`,
-      });
-
-      attempts.push({
-        method: 'PATCH',
-        path: '/devices/device_shadows',
-        body: {
-          ...reference.ref,
-          shadow: {
-            [propertyName]: value,
-          },
-        },
-        description: `PATCH /devices/device_shadows with shadow object (${reference.description})`,
-      });
-    }
-
-    attempts.push({
-      method: 'POST',
-      path: '/devices/device_shadows',
-      body: {
-        device_shadows: [
-          {
-            dsn,
-            shadow: {
-              [propertyName]: value,
-            },
-          },
-        ],
-      },
-      description: 'POST /devices/device_shadows with device_shadows[]',
-    });
-
-    attempts.push({
-      method: 'POST',
-      path: '/devices/bulk',
-      body: {
-        updates: [
-          {
-            dsn,
-            property_name: propertyName,
-            value,
-          },
-        ],
-      },
-      description: 'POST /devices/bulk with updates[]',
-    });
-
-    attempts.push({
-      method: 'POST',
-      path: '/devices/bulk',
-      body: {
-        dsn,
-        property_name: propertyName,
-        value,
-      },
-      description: 'POST /devices/bulk with flat payload',
-    });
-
-    return attempts;
-  }
-
-  private findDeviceIdByDsn(dsn: string): string | undefined {
-    for (const [id, mappedDsn] of this.deviceIdToDsn) {
-      if (mappedDsn === dsn) {
-        return id;
-      }
-    }
-    return undefined;
-  }
-
-  private findDeviceKeyByDsn(dsn: string): string | undefined {
-    for (const [key, mappedDsn] of this.deviceKeyToDsn) {
-      if (mappedDsn === dsn) {
-        return key;
-      }
-    }
-    return undefined;
   }
 
   private updateCachedProperty(dsn: string, propertyName: string, value: unknown): void {

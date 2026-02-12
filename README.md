@@ -27,7 +27,7 @@ The plugin follows the app's modern cloud stack:
 - Property shadow endpoint: `POST /devices/device_shadows` with `{ "device_codes": [...] }` (with compatibility fallback shapes)
 - Control write endpoint (primary): AWS IoT shadow MQTT publish to `$aws/things/{dsn}/shadow/update` over SigV4-signed WebSocket, using temporary credentials from Cognito Identity
 - Control write endpoint (secondary fallback): AWS IoT thing-shadow `POST /things/{dsn}/shadow` with SigV4 signing
-- Control write endpoint (compatibility fallback): `POST /devices/bulk` and `PATCH /devices/device_shadows` payload variants
+- Control write endpoint (compatibility fallback): a single `POST /devices/bulk` properties payload
 
 ## Install
 
@@ -111,8 +111,9 @@ Examples:
 - Primary write path matches Salus app behavior via AWS IoT MQTT shadow updates (`$aws/things/{dsn}/shadow/update` with `state.desired.<baseKey>.properties`).
 - Automatic MQTT write retries for transient connection issues and AWS credential refresh on authorization failures.
 - Automatic AWS IoT credential refresh and signing-service fallback (`iotdevicegateway` -> `iotdata`) for tenant variations.
-- Service API write payload fallbacks remain enabled as a compatibility safety net.
+- A single service-api bulk-write compatibility fallback is kept as a safety net (brute-force write shape probing removed).
 - Per-poll property refresh (with cached fallback on transient errors) to keep HomeKit target/current values up-to-date.
+- Polling now uses a fast path: lightweight shadow refresh on most cycles and full discovery periodically, which improves Home app <-> Salus app sync latency.
 - Thermostat write confirmation loop verifies that setpoint actually changed in cloud state; failed convergence is surfaced as HomeKit communication failure instead of silent no-op.
 - Thermostat setpoint writes use command datapoints (`SetHeatingSetpoint*`) together with manual/working mode hints (`SetHoldType=2`, `SetSystemMode=4`) to match Salus app behavior.
 - Device online state is inferred from Salus connectivity datapoints (`connected`, `OnlineState`, `OnlineStatus_i`, etc.) and mapped to HomeKit reachability so disconnected devices can show as not responding.
