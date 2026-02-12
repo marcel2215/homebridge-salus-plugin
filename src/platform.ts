@@ -12,10 +12,16 @@ import type { DeviceProfile, PlatformAccessoryContext, SalusDevice, SalusPlatfor
 const DEFAULT_POLL_INTERVAL_SECONDS = 20;
 const DEFAULT_MAX_PARALLEL_PROPERTY_REQUESTS = 4;
 const DEFAULT_FULL_DISCOVERY_INTERVAL_SECONDS = 300;
+const WRITE_BOOST_POLL_INTERVAL_SECONDS = 8;
+const WRITE_BOOST_WINDOW_MS = 60_000;
 const MIN_POLL_INTERVAL_SECONDS = 10;
 const MAX_POLL_INTERVAL_SECONDS = 300;
 const STALE_ACCESSORY_REMOVAL_GRACE_POLLS = 3;
 const POLL_BUSY_LOG_THROTTLE_MS = 30_000;
+const POLL_FAILURE_BACKOFF_BASE_MS = 5_000;
+const POLL_FAILURE_BACKOFF_MAX_MS = 300_000;
+const POLL_DELAY_JITTER_FACTOR = 0.15;
+const POLL_HEALTH_LOG_EVERY_CYCLES = 30;
 
 const THERMOSTAT_PROPERTY_BASES = [
   'HeatingSetpoint_x100',
@@ -156,6 +162,7 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
   private readonly cloudClient: SalusCloudClient | null;
   private readonly pollIntervalMs: number;
   private readonly fullDiscoveryIntervalMs: number;
+  private readonly writeBoostPollIntervalMs: number;
   private readonly maxParallelPropertyRequests: number;
   private readonly missingAccessoryPollCounts: Map<string, number> = new Map();
   private pollTimer: NodeJS.Timeout | null = null;
@@ -163,6 +170,11 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
   private pollRequestedWhileBusy = false;
   private lastBusyPollLogEpochMs = 0;
   private lastFullDiscoveryEpochMs = 0;
+  private boostPollingUntilEpochMs = 0;
+  private consecutivePollFailures = 0;
+  private totalPollCycles = 0;
+  private successfulPollCycles = 0;
+  private lastSuccessfulPollEpochMs = 0;
   private launchCompleted = false;
   private hasLoggedDuplicateRegisterWorkaround = false;
 
@@ -186,6 +198,10 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
     this.fullDiscoveryIntervalMs = Math.max(
       this.pollIntervalMs,
       Math.round((DEFAULT_FULL_DISCOVERY_INTERVAL_SECONDS) * 1_000),
+    );
+    this.writeBoostPollIntervalMs = Math.max(
+      5_000,
+      Math.min(this.pollIntervalMs, Math.round(WRITE_BOOST_POLL_INTERVAL_SECONDS * 1_000)),
     );
 
     if (!this.configTyped.email || !this.configTyped.password) {
@@ -237,7 +253,8 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
         const summary = entries.map(([name, value]) => `${name}=${JSON.stringify(value)}`).join(', ');
         this.log.debug(`Set ${entries.length} datapoints for ${device.name} (${device.dsn}): ${summary}`);
       }
-      this.schedulePoll(2_000);
+      this.markWriteBoostWindow();
+      this.schedulePoll(1_000);
     } catch (error) {
       const summary = entries.map(([name, value]) => `${name}=${JSON.stringify(value)}`).join(', ');
       this.log.error(`Failed to set datapoint(s) on ${device.name}: ${summary}. ${asErrorMessage(error)}`);
@@ -272,6 +289,55 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
     }, Math.max(0, delayMs));
   }
 
+  private markWriteBoostWindow(): void {
+    const boostedUntil = Date.now() + WRITE_BOOST_WINDOW_MS;
+    if (boostedUntil > this.boostPollingUntilEpochMs) {
+      this.boostPollingUntilEpochMs = boostedUntil;
+    }
+  }
+
+  private getActivePollIntervalMs(): number {
+    if (Date.now() < this.boostPollingUntilEpochMs) {
+      return this.writeBoostPollIntervalMs;
+    }
+    return this.pollIntervalMs;
+  }
+
+  private withDelayJitter(baseDelayMs: number): number {
+    const bounded = Math.max(1_000, Math.round(baseDelayMs));
+    const spread = bounded * POLL_DELAY_JITTER_FACTOR;
+    const jittered = bounded + ((Math.random() * 2 * spread) - spread);
+    return Math.max(1_000, Math.round(jittered));
+  }
+
+  private computeNextPollDelayMs(): number {
+    if (this.consecutivePollFailures <= 0) {
+      return this.withDelayJitter(this.getActivePollIntervalMs());
+    }
+
+    const exponent = Math.min(6, this.consecutivePollFailures - 1);
+    const baseBackoff = Math.min(
+      POLL_FAILURE_BACKOFF_MAX_MS,
+      POLL_FAILURE_BACKOFF_BASE_MS * (2 ** exponent),
+    );
+    return this.withDelayJitter(baseBackoff);
+  }
+
+  private maybeLogPollHealth(): void {
+    if (this.totalPollCycles <= 0 || (this.totalPollCycles % POLL_HEALTH_LOG_EVERY_CYCLES) !== 0) {
+      return;
+    }
+    const successRate = Math.round((this.successfulPollCycles / this.totalPollCycles) * 100);
+    const sinceLastSuccessSec = this.lastSuccessfulPollEpochMs > 0
+      ? Math.round((Date.now() - this.lastSuccessfulPollEpochMs) / 1000)
+      : -1;
+    const sinceLastSuccessText = sinceLastSuccessSec >= 0 ? `${sinceLastSuccessSec}s` : 'n/a';
+    this.log.info(
+      `Salus poll health: success=${this.successfulPollCycles}/${this.totalPollCycles} (${successRate}%),`
+      + ` consecutiveFailures=${this.consecutivePollFailures}, lastSuccessAgo=${sinceLastSuccessText}.`,
+    );
+  }
+
   private async pollDevices(): Promise<void> {
     if (!this.cloudClient) {
       return;
@@ -287,7 +353,9 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
     }
 
     this.pollInProgress = true;
+    this.totalPollCycles += 1;
     const discoveredUuids = new Set<string>();
+    let nextPollDelayMs: number | undefined;
 
     try {
       const now = Date.now();
@@ -300,8 +368,16 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
         devices = await this.cloudClient.listDevices();
         this.lastFullDiscoveryEpochMs = Date.now();
       } else {
-        await this.cloudClient.refreshKnownDeviceShadows();
-        devices = this.cloudClient.getKnownDevicesSnapshot();
+        try {
+          await this.cloudClient.refreshKnownDeviceShadows();
+          devices = this.cloudClient.getKnownDevicesSnapshot();
+        } catch (error) {
+          this.log.info(
+            `Fast Salus shadow refresh failed (${asErrorMessage(error)}). Falling back to full discovery.`,
+          );
+          devices = await this.cloudClient.listDevices();
+          this.lastFullDiscoveryEpochMs = Date.now();
+        }
         if (devices.length === 0) {
           devices = await this.cloudClient.listDevices();
           this.lastFullDiscoveryEpochMs = Date.now();
@@ -359,15 +435,30 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
 
       this.removeStaleAccessories(discoveredUuids);
       this.log.info(`Salus sync completed: ${uniqueDevices.length} device(s) discovered, ${updatedDeviceCount} device(s) refreshed.`);
+      this.consecutivePollFailures = 0;
+      this.successfulPollCycles += 1;
+      this.lastSuccessfulPollEpochMs = Date.now();
+      this.maybeLogPollHealth();
     } catch (error) {
+      this.consecutivePollFailures += 1;
+      this.lastFullDiscoveryEpochMs = 0;
       this.log.error(`Salus sync failed: ${asErrorMessage(error)}`);
+      nextPollDelayMs = this.computeNextPollDelayMs();
+      if (this.consecutivePollFailures === 1 || this.consecutivePollFailures % 3 === 0) {
+        const nextDelaySeconds = Math.round(nextPollDelayMs / 1000);
+        this.log.warn(
+          `Salus sync has failed ${this.consecutivePollFailures} consecutive time(s).`
+          + ` Next retry in ~${nextDelaySeconds}s with backoff.`,
+        );
+      }
+      this.maybeLogPollHealth();
     } finally {
       this.pollInProgress = false;
       if (this.pollRequestedWhileBusy) {
         this.pollRequestedWhileBusy = false;
         this.schedulePoll(0);
       } else {
-        this.schedulePoll(this.pollIntervalMs);
+        this.schedulePoll(nextPollDelayMs ?? this.computeNextPollDelayMs());
       }
     }
   }
@@ -442,15 +533,20 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
     }
 
     const context = accessory.context as PlatformAccessoryContext;
-    context.device = {
+    const nextContextDevice = {
       id: device.id,
       dsn: device.dsn,
       key: device.key,
       model: device.model,
       name: device.name,
     };
-    context.profile = profile;
-    this.api.updatePlatformAccessories([accessory]);
+    const contextChanged = !areContextDevicesEqual(context.device, nextContextDevice)
+      || !areProfilesEquivalent(context.profile, profile);
+    if (contextChanged) {
+      context.device = nextContextDevice;
+      context.profile = profile;
+      this.api.updatePlatformAccessories([accessory]);
+    }
 
     let handler = this.accessoryHandlers.get(accessory.UUID);
     if (!handler) {
@@ -793,6 +889,31 @@ function asErrorMessage(error: unknown): string {
     return error.message;
   }
   return String(error);
+}
+
+function areContextDevicesEqual(
+  left: PlatformAccessoryContext['device'],
+  right: PlatformAccessoryContext['device'],
+): boolean {
+  if (!left || !right) {
+    return false;
+  }
+  return left.id === right.id
+    && left.dsn === right.dsn
+    && left.key === right.key
+    && left.model === right.model
+    && left.name === right.name;
+}
+
+function areProfilesEquivalent(
+  left: PlatformAccessoryContext['profile'],
+  right: PlatformAccessoryContext['profile'],
+): boolean {
+  if (!left || !right) {
+    return false;
+  }
+  return left.kind === right.kind
+    && left.catalog?.model === right.catalog?.model;
 }
 
 function clamp(value: number, minValue: number, maxValue: number): number {

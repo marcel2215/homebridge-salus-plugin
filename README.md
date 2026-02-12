@@ -103,6 +103,7 @@ Examples:
 
 - Automatic token refresh before expiry and on `401` responses.
 - Exponential backoff retries for transient network/API failures.
+- Poll scheduler applies adaptive backoff + jitter after consecutive sync failures to avoid request storms and improve long-run durability.
 - API base fallback between `/api/v1` and `/api/v2`.
 - Modern discovery fallback from `occupants` API to legacy `/devices` API shape.
 - Bounded `occupants/slider_details` traversal per poll (target-count + time budget) to avoid long stalls during upstream `5xx` bursts.
@@ -114,10 +115,13 @@ Examples:
 - A single service-api bulk-write compatibility fallback is kept as a safety net (brute-force write shape probing removed).
 - Per-poll property refresh (with cached fallback on transient errors) to keep HomeKit target/current values up-to-date.
 - Polling now uses a fast path: lightweight shadow refresh on most cycles and full discovery periodically, which improves Home app <-> Salus app sync latency.
+- After thermostat writes, polling is temporarily boosted (short interval window) to make state convergence feel snappier without permanently increasing cloud request load.
+- Thermostat target updates use a short-lived optimistic cache in HomeKit (up to 60s) so Home app does not bounce back while Salus cloud is still applying the command.
 - Thermostat write confirmation loop verifies that setpoint actually changed in cloud state; failed convergence is surfaced as HomeKit communication failure instead of silent no-op.
 - Thermostat setpoint writes use command datapoints (`SetHeatingSetpoint*`) together with manual/working mode hints (`SetHoldType=2`, `SetSystemMode=4`) to match Salus app behavior.
 - Device online state is inferred from Salus connectivity datapoints (`connected`, `OnlineState`, `OnlineStatus_i`, etc.) and mapped to HomeKit reachability so disconnected devices can show as not responding.
 - Immediate short re-poll after write to keep HomeKit state aligned.
+- Poll health telemetry is logged periodically (success rate, consecutive failures, last successful sync age) to simplify long-term monitoring.
 - Detailed logs for auth, discovery, shadow sync, writes, retries, and failures.
 
 ## Thermostat mode mapping

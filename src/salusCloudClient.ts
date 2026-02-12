@@ -31,7 +31,7 @@ interface RequestOptions {
 interface CognitoSession {
   accessToken: string;
   idToken: string;
-  refreshToken: string;
+  refreshToken?: string;
   tokenType: string;
   expiresAtEpochMs: number;
   companyCode?: string;
@@ -68,17 +68,9 @@ interface ShadowRequestVariant {
   description: string;
 }
 
-interface WriteAttempt {
-  method: HttpMethod;
-  path: string;
-  body: unknown;
-  description: string;
-}
-
 interface AwsShadowWriteContext {
   branchKeys: string[];
   includeRootProperties: boolean;
-  propertyNames: string[];
 }
 
 interface OccupantsSliderTarget {
@@ -375,7 +367,7 @@ export class SalusCloudClient {
   }
 
   public getCachedProperties(dsn: string): SalusPropertyMap | undefined {
-    return this.propertyCacheByDsn.get(dsn);
+    return this.propertyCacheByDsn.get(canonicalizeDsn(dsn));
   }
 
   public getKnownDevicesSnapshot(): SalusDevice[] {
@@ -897,7 +889,7 @@ export class SalusCloudClient {
       try {
         return await this.listPropertiesLegacy(dsn);
       } catch (error) {
-        const cachedFallback = this.propertyCacheByDsn.get(dsn);
+        const cachedFallback = this.propertyCacheByDsn.get(canonicalizeDsn(dsn));
         if (cachedFallback) {
           if (this.verboseLogging) {
             this.log.debug(`Legacy property sync failed for ${dsn}; returning cached values (${asErrorMessage(error)}).`);
@@ -918,7 +910,7 @@ export class SalusCloudClient {
       this.blockModernDeviceShadows(
         `Salus cloud denied direct property sync for ${dsn} (${asErrorMessage(error)}).`,
       );
-      const cachedAfterFailure = this.propertyCacheByDsn.get(dsn);
+      const cachedAfterFailure = this.propertyCacheByDsn.get(canonicalizeDsn(dsn));
       if (cachedAfterFailure) {
         if (this.verboseLogging) {
           this.log.debug(`Using cached properties for ${dsn} after restricted property sync (${asErrorMessage(error)}).`);
@@ -931,15 +923,18 @@ export class SalusCloudClient {
   }
 
   private async listPropertiesModern(dsn: string): Promise<SalusPropertyMap> {
+    const dsnKey = canonicalizeDsn(dsn);
     if (this.isModernDeviceShadowBlocked()) {
-      return this.propertyCacheByDsn.get(dsn) ?? new Map();
+      return this.propertyCacheByDsn.get(dsnKey) ?? new Map();
     }
 
     const shadows = await this.fetchDeviceShadows([], [dsn]);
     this.unblockModernDeviceShadows();
-    const fromFetch = shadows.get(dsn);
+    const fromFetch = shadows.get(dsn)
+      ?? shadows.get(dsnKey)
+      ?? [...shadows.entries()].find(([candidateDsn]) => canonicalizeDsn(candidateDsn) === dsnKey)?.[1];
     if (fromFetch) {
-      this.propertyCacheByDsn.set(dsn, fromFetch);
+      this.propertyCacheByDsn.set(dsnKey, fromFetch);
       return fromFetch;
     }
 
@@ -965,7 +960,7 @@ export class SalusCloudClient {
 
     const parsed = parseProperties(payload);
     if (parsed.size > 0) {
-      this.propertyCacheByDsn.set(dsn, parsed);
+      this.propertyCacheByDsn.set(canonicalizeDsn(dsn), parsed);
       return parsed;
     }
 
@@ -1302,21 +1297,31 @@ export class SalusCloudClient {
 
     await new Promise<void>((resolve, reject) => {
       let settled = false;
+      let timeout: NodeJS.Timeout | null = null;
+      let client: mqtt.MqttClient | null = null;
+      const cleanup = () => {
+        if (timeout) {
+          clearTimeout(timeout);
+          timeout = null;
+        }
+        if (client) {
+          client.removeListener('connect', onConnect);
+          client.removeListener('error', onError);
+          client.removeListener('close', onClose);
+          client.removeListener('offline', onOffline);
+          try {
+            client.end(true);
+          } catch {
+            // Ignore close failures in cleanup path.
+          }
+        }
+      };
       const finish = (error?: unknown) => {
         if (settled) {
           return;
         }
         settled = true;
-        clearTimeout(timeout);
-        client.removeListener('connect', onConnect);
-        client.removeListener('error', onError);
-        client.removeListener('close', onClose);
-        client.removeListener('offline', onOffline);
-        try {
-          client.end(true);
-        } catch {
-          // Ignore close failures in cleanup path.
-        }
+        cleanup();
 
         if (error) {
           reject(error instanceof Error ? error : new Error(String(error)));
@@ -1326,7 +1331,12 @@ export class SalusCloudClient {
       };
 
       const onConnect = () => {
-        client.publish(topic, payloadText, { qos: 1 }, (error) => {
+        const activeClient = client;
+        if (!activeClient) {
+          finish(new Error('MQTT client was not initialized before connect callback.'));
+          return;
+        }
+        activeClient.publish(topic, payloadText, { qos: 1 }, (error) => {
           if (error) {
             finish(new Error(`MQTT publish failed on ${topic}: ${asErrorMessage(error)}`));
             return;
@@ -1353,25 +1363,30 @@ export class SalusCloudClient {
         finish(new Error('MQTT connection went offline before publish acknowledgement.'));
       };
 
-      const timeout = setTimeout(() => {
+      timeout = setTimeout(() => {
         finish(new Error(`MQTT publish timed out after ${connectTimeoutMs}ms.`));
       }, connectTimeoutMs);
 
-      const client = mqtt.connect(url, {
-        clientId,
-        protocolVersion: 4,
-        clean: true,
-        resubscribe: false,
-        keepalive: 60,
-        reconnectPeriod: 0,
-        connectTimeout: connectTimeoutMs,
-        rejectUnauthorized: !this.allowInsecureTls,
-        wsOptions: {
-          headers: {
-            'Sec-WebSocket-Protocol': 'mqtt',
+      try {
+        client = mqtt.connect(url, {
+          clientId,
+          protocolVersion: 4,
+          clean: true,
+          resubscribe: false,
+          keepalive: 60,
+          reconnectPeriod: 0,
+          connectTimeout: connectTimeoutMs,
+          rejectUnauthorized: !this.allowInsecureTls,
+          wsOptions: {
+            headers: {
+              'Sec-WebSocket-Protocol': 'mqtt',
+            },
           },
-        },
-      });
+        });
+      } catch (error) {
+        finish(new Error(`MQTT connection initialization failed: ${asErrorMessage(error)}`));
+        return;
+      }
 
       client.on('connect', onConnect);
       client.on('error', onError);
@@ -1404,7 +1419,7 @@ export class SalusCloudClient {
   }
 
   private async resolveShadowWriteContextForDatapoint(dsn: string, propertyName: string): Promise<AwsShadowWriteContext> {
-    const propertyNames = this.buildShadowPropertyWriteVariants(propertyName);
+    const dsnKey = canonicalizeDsn(dsn);
     const branchKeys = new Set<string>();
     let includeRootProperties = false;
 
@@ -1413,7 +1428,7 @@ export class SalusCloudClient {
       branchKeys.add(shortId);
     }
 
-    const cachedBaseKey = this.shadowBaseKeyByDsn.get(dsn);
+    const cachedBaseKey = this.shadowBaseKeyByDsn.get(dsnKey);
     if (cachedBaseKey) {
       branchKeys.add(cachedBaseKey);
     }
@@ -1439,7 +1454,7 @@ export class SalusCloudClient {
       }
     }
 
-    const resolvedBaseKey = this.shadowBaseKeyByDsn.get(dsn);
+    const resolvedBaseKey = this.shadowBaseKeyByDsn.get(dsnKey);
     if (resolvedBaseKey) {
       branchKeys.add(resolvedBaseKey);
     }
@@ -1451,7 +1466,6 @@ export class SalusCloudClient {
     return {
       branchKeys: [...branchKeys],
       includeRootProperties,
-      propertyNames,
     };
   }
 
@@ -1628,35 +1642,10 @@ export class SalusCloudClient {
     return last.toLowerCase();
   }
 
-  private async resolveShadowBaseKeyForWrite(dsn: string, propertyName: string): Promise<string> {
-    const cached = this.shadowBaseKeyByDsn.get(dsn);
-    if (cached) {
-      return cached;
-    }
-
-    try {
-      const payload = await this.requestServiceJson('/devices/device_shadows', {
-        method: 'POST',
-        body: { device_codes: [dsn] },
-        auth: true,
-        activeServiceBaseOnly: true,
-      });
-      this.updateShadowBaseKeyCache(payload, propertyName);
-    } catch (error) {
-      if (this.verboseLogging) {
-        this.log.debug(`Unable to resolve shadow base key via /devices/device_shadows for ${dsn}: ${asErrorMessage(error)}`);
-      }
-    }
-
-    const resolved = this.shadowBaseKeyByDsn.get(dsn) ?? '11';
-    this.shadowBaseKeyByDsn.set(dsn, resolved);
-    return resolved;
-  }
-
   private updateShadowBaseKeyCache(payload: unknown, propertyNameHint?: string): void {
     const mappings = parseDeviceShadowBaseKeys(payload, this.deviceIdToDsn, this.deviceKeyToDsn, propertyNameHint);
     for (const [dsn, baseKey] of mappings) {
-      this.shadowBaseKeyByDsn.set(dsn, baseKey);
+      this.shadowBaseKeyByDsn.set(canonicalizeDsn(dsn), baseKey);
     }
   }
 
@@ -1941,7 +1930,7 @@ export class SalusCloudClient {
     const encodedDsn = encodeURIComponent(dsn);
     const encodedPropertyName = encodeURIComponent(propertyName);
 
-    const attempts: WriteAttempt[] = [
+    const attempts: Array<{ method: HttpMethod; path: string; body: unknown; description: string }> = [
       {
         method: 'POST',
         path: `/apiv1/dsns/${encodedDsn}/properties/${encodedPropertyName}/datapoints.json`,
@@ -2063,15 +2052,16 @@ export class SalusCloudClient {
   private replacePropertyCache(next: Map<string, SalusPropertyMap>): void {
     this.propertyCacheByDsn.clear();
     for (const [dsn, properties] of next) {
-      this.propertyCacheByDsn.set(dsn, properties);
+      this.propertyCacheByDsn.set(canonicalizeDsn(dsn), properties);
     }
   }
 
   private mergeIntoPropertyCache(next: Map<string, SalusPropertyMap>): void {
     for (const [dsn, properties] of next) {
-      const existing = this.propertyCacheByDsn.get(dsn);
+      const dsnKey = canonicalizeDsn(dsn);
+      const existing = this.propertyCacheByDsn.get(dsnKey);
       if (!existing) {
-        this.propertyCacheByDsn.set(dsn, properties);
+        this.propertyCacheByDsn.set(dsnKey, properties);
         continue;
       }
       mergePropertyMaps(existing, properties);
@@ -2359,10 +2349,11 @@ export class SalusCloudClient {
   }
 
   private updateCachedProperty(dsn: string, propertyName: string, value: unknown): void {
-    let map = this.propertyCacheByDsn.get(dsn);
+    const dsnKey = canonicalizeDsn(dsn);
+    let map = this.propertyCacheByDsn.get(dsnKey);
     if (!map) {
       map = new Map();
-      this.propertyCacheByDsn.set(dsn, map);
+      this.propertyCacheByDsn.set(dsnKey, map);
     }
 
     map.set(propertyName, {
@@ -3863,9 +3854,14 @@ function parseCognitoTokens(payload: unknown, refreshTokenFallback?: string): Co
   const issuerDetails = parseCognitoIssuerDetails(decodedIdTokenClaims, decodedAccessTokenClaims);
 
   const expiresInRaw = parseNumberLike(authResult.ExpiresIn);
-  const expiresInSeconds = expiresInRaw && Number.isFinite(expiresInRaw) ? Math.max(60, Math.floor(expiresInRaw)) : 3600;
+  const expiresInSeconds = expiresInRaw && Number.isFinite(expiresInRaw) ? Math.max(60, Math.floor(expiresInRaw)) : undefined;
+  const tokenExpSeconds = parseNumberLike(decodedAccessTokenClaims?.exp ?? decodedIdTokenClaims?.exp);
+  const nowSeconds = Math.floor(Date.now() / 1_000);
+  const expiresAtFromToken = tokenExpSeconds && tokenExpSeconds > Math.max(1_000_000_000, nowSeconds + 60)
+    ? Math.floor(tokenExpSeconds * 1_000)
+    : undefined;
 
-  if (!accessToken || !idToken || !refreshToken) {
+  if (!accessToken || !idToken) {
     return undefined;
   }
 
@@ -3874,7 +3870,9 @@ function parseCognitoTokens(payload: unknown, refreshTokenFallback?: string): Co
     idToken,
     refreshToken,
     tokenType,
-    expiresAtEpochMs: Date.now() + (expiresInSeconds * 1_000),
+    expiresAtEpochMs: expiresInSeconds !== undefined
+      ? Date.now() + (expiresInSeconds * 1_000)
+      : (expiresAtFromToken ?? (Date.now() + (3600 * 1_000))),
     companyCode: extractCompanyCodeFromTokenClaims(decodedIdTokenClaims, decodedAccessTokenClaims),
     cognitoRegion: issuerDetails?.region,
     userPoolId: issuerDetails?.userPoolId,
@@ -5376,7 +5374,11 @@ function deriveOnlineState(record: Record<string, unknown>): boolean | undefined
 function dedupeDevicesByDsn(devices: SalusDevice[]): SalusDevice[] {
   const byDsn = new Map<string, SalusDevice>();
   for (const device of devices) {
-    byDsn.set(device.dsn, device);
+    const key = canonicalizeDsn(device.dsn);
+    const existing = byDsn.get(key);
+    if (!existing || scoreDeviceForMergePreference(device) > scoreDeviceForMergePreference(existing)) {
+      byDsn.set(key, device);
+    }
   }
   return [...byDsn.values()];
 }
@@ -5384,12 +5386,32 @@ function dedupeDevicesByDsn(devices: SalusDevice[]): SalusDevice[] {
 function mergeDevicesPreferCurrent(current: SalusDevice[], previous: SalusDevice[]): SalusDevice[] {
   const byDsn = new Map<string, SalusDevice>();
   for (const device of previous) {
-    byDsn.set(device.dsn, device);
+    byDsn.set(canonicalizeDsn(device.dsn), device);
   }
   for (const device of current) {
-    byDsn.set(device.dsn, device);
+    byDsn.set(canonicalizeDsn(device.dsn), device);
   }
   return [...byDsn.values()];
+}
+
+function scoreDeviceForMergePreference(device: SalusDevice): number {
+  let score = 0;
+  if (normalizeNonEmptyString(device.model)) {
+    score += 3;
+  }
+  if (normalizeNonEmptyString(device.name)) {
+    score += 2;
+  }
+  if (normalizeNonEmptyString(device.productName)) {
+    score += 1;
+  }
+  if (device.online !== undefined) {
+    score += 1;
+  }
+  if (normalizeNonEmptyString(device.key)) {
+    score += 1;
+  }
+  return score;
 }
 
 function mergePropertyMaps(target: SalusPropertyMap, source: SalusPropertyMap): void {
@@ -5409,6 +5431,10 @@ function prioritizeByDescription<T extends { description: string }>(items: T[], 
   }
 
   return [preferred, ...items.filter((item) => item !== preferred)];
+}
+
+function canonicalizeDsn(value: string): string {
+  return value.trim().toLowerCase();
 }
 
 function isRetriableFailure(error: unknown): boolean {

@@ -166,6 +166,8 @@ const SALUS_MODE = {
   cool: 3,
   heat: 4,
 };
+const THERMOSTAT_APPLY_TOLERANCE_C = 0.4;
+const THERMOSTAT_OPTIMISTIC_TARGET_TTL_MS = 60_000;
 
 type TargetCharacteristicType = {
   OFF: number;
@@ -193,6 +195,12 @@ interface WriteTargets {
   lock?: string;
 }
 
+interface OptimisticThermostatTarget {
+  valueC: number;
+  expiresAtEpochMs: number;
+  writeSequence: number;
+}
+
 export class SalusPlatformAccessory {
   private service: Service;
   private currentKind: HomeKitDeviceKind;
@@ -202,6 +210,7 @@ export class SalusPlatformAccessory {
   private cachedTargetState = 0;
   private cachedSystemMode = SALUS_MODE.auto;
   private thermostatSetpointWriteSequence = 0;
+  private optimisticThermostatTarget: OptimisticThermostatTarget | null = null;
 
   constructor(
     private readonly platform: SalusHomebridgePlatform,
@@ -250,7 +259,7 @@ export class SalusPlatformAccessory {
     const hapAccessory = (this.accessory as unknown as {
       _associatedHAPAccessory?: { reachable?: boolean };
     })._associatedHAPAccessory;
-    if (hapAccessory && typeof hapAccessory.reachable === 'boolean' && hapAccessory.reachable !== expectedReachable) {
+    if (hapAccessory && hapAccessory.reachable !== expectedReachable) {
       hapAccessory.reachable = expectedReachable;
       this.platform.log.info(
         `${this.device.name} (${this.device.dsn}) marked as ${expectedReachable ? 'reachable' : 'unreachable'} based on Salus cloud online state.`,
@@ -506,6 +515,14 @@ export class SalusPlatformAccessory {
       const previousTarget = previousTargetRaw === null ? undefined : parseCharacteristicNumber(previousTargetRaw);
       if (previousTarget !== undefined) {
         targetTemp = clamp(previousTarget, 4.5, 35);
+      }
+    }
+
+    const optimisticTarget = this.getActiveOptimisticThermostatTarget();
+    if (optimisticTarget) {
+      targetTemp = clamp(optimisticTarget.valueC, 4.5, 35);
+      if (heatingSetpoint !== undefined && Math.abs(heatingSetpoint - optimisticTarget.valueC) <= THERMOSTAT_APPLY_TOLERANCE_C) {
+        this.optimisticThermostatTarget = null;
       }
     }
 
@@ -783,6 +800,7 @@ export class SalusPlatformAccessory {
 
     const targetTemperature = clamp(numericValue, 4.5, 35);
     const writeSequence = ++this.thermostatSetpointWriteSequence;
+    this.setOptimisticThermostatTarget(targetTemperature, writeSequence);
 
     const setpointProperty = this.firstDefined(
       this.writeTargets.heatSetpoint,
@@ -809,29 +827,32 @@ export class SalusPlatformAccessory {
       writes[this.writeTargets.holdType] = 2;
     }
 
-    await this.platform.writeDeviceProperties(this.device, writes);
-    const confirmation = await this.ensureThermostatTargetApplied(targetTemperature, writeSequence);
-    if (confirmation === 'superseded') {
-      this.platform.log.debug(
-        `Skipped outdated thermostat confirmation for ${this.device.name}; a newer target write is in progress.`,
-      );
-      return;
+    try {
+      await this.platform.writeDeviceProperties(this.device, writes);
+    } catch (error) {
+      if (this.optimisticThermostatTarget?.writeSequence === writeSequence) {
+        this.optimisticThermostatTarget = null;
+      }
+      this.platform.log.error(`Thermostat target write failed for ${this.device.name}: ${asErrorMessage(error)}`);
+      throw this.communicationFailure('Thermostat target temperature write failed');
     }
+
     this.cachedTargetState = this.platform.Characteristic.TargetHeatingCoolingState.HEAT;
     this.cachedSystemMode = SALUS_MODE.heat;
     this.platform.log.info(`Set thermostat target for ${this.device.name} to ${targetTemperature.toFixed(1)}°C`);
+    void this.confirmThermostatTargetInBackground(targetTemperature, writeSequence);
   }
 
   private async ensureThermostatTargetApplied(
     expectedTemperatureC: number,
     writeSequence: number,
-  ): Promise<'applied' | 'superseded'> {
+  ): Promise<'applied' | 'superseded' | 'pending'> {
     const maxAttempts = 10;
-    const toleranceC = 0.4;
     let lastObserved: number | undefined;
     let lastPrimaryObserved: number | undefined;
     let lastCommandObserved: number | undefined;
     let lastError: unknown;
+    let sawCommandMatch = false;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (writeSequence !== this.thermostatSetpointWriteSequence) {
@@ -855,7 +876,11 @@ export class SalusPlatformAccessory {
           }
         }
 
-        const primaryMatches = primaryC !== undefined && Math.abs(primaryC - expectedTemperatureC) <= toleranceC;
+        const primaryMatches = primaryC !== undefined && Math.abs(primaryC - expectedTemperatureC) <= THERMOSTAT_APPLY_TOLERANCE_C;
+        const commandMatches = commandC !== undefined && Math.abs(commandC - expectedTemperatureC) <= THERMOSTAT_APPLY_TOLERANCE_C;
+        if (commandMatches) {
+          sawCommandMatch = true;
+        }
         if (primaryMatches) {
           return 'applied';
         }
@@ -869,18 +894,50 @@ export class SalusPlatformAccessory {
     }
 
     if (lastError) {
-      this.platform.log.warn(
-        `Unable to confirm thermostat setpoint for ${this.device.name} after write: ${asErrorMessage(lastError)}`,
+      this.platform.log.info(
+        `Thermostat setpoint confirmation is delayed for ${this.device.name}: ${asErrorMessage(lastError)}.`
+        + ' Continuing with optimistic HomeKit value.',
       );
-    } else {
-      this.platform.log.warn(
-        `Thermostat setpoint for ${this.device.name} did not converge to ${expectedTemperatureC.toFixed(1)}°C`
-        + `${lastObserved !== undefined ? ` (latest observed ${lastObserved.toFixed(1)}°C)` : ''}`
-        + `${lastPrimaryObserved !== undefined ? `, effective=${lastPrimaryObserved.toFixed(1)}°C` : ''}`
-        + `${lastCommandObserved !== undefined ? `, command=${lastCommandObserved.toFixed(1)}°C` : ''}`,
+      return 'pending';
+    }
+    this.platform.log.info(
+      `Thermostat setpoint for ${this.device.name} did not converge to ${expectedTemperatureC.toFixed(1)}°C yet`
+      + `${lastObserved !== undefined ? ` (latest observed ${lastObserved.toFixed(1)}°C)` : ''}`
+      + `${lastPrimaryObserved !== undefined ? `, effective=${lastPrimaryObserved.toFixed(1)}°C` : ''}`
+      + `${lastCommandObserved !== undefined ? `, command=${lastCommandObserved.toFixed(1)}°C` : ''}`
+      + `${sawCommandMatch ? '. Command is queued in cloud.' : '.'}`,
+    );
+    return 'pending';
+  }
+
+  private async confirmThermostatTargetInBackground(
+    expectedTemperatureC: number,
+    writeSequence: number,
+  ): Promise<void> {
+    try {
+      const confirmation = await this.ensureThermostatTargetApplied(expectedTemperatureC, writeSequence);
+      if (confirmation === 'superseded') {
+        this.platform.log.debug(
+          `Skipped outdated thermostat confirmation for ${this.device.name}; a newer target write is in progress.`,
+        );
+        return;
+      }
+      if (confirmation === 'applied') {
+        if (this.optimisticThermostatTarget?.writeSequence === writeSequence) {
+          this.optimisticThermostatTarget = null;
+        }
+        return;
+      }
+      this.platform.log.info(
+        `Thermostat target for ${this.device.name} is pending Salus cloud apply; keeping optimistic HomeKit value for`
+        + ` ${Math.round(THERMOSTAT_OPTIMISTIC_TARGET_TTL_MS / 1000)}s.`,
+      );
+    } catch (error) {
+      this.platform.log.info(
+        `Thermostat target confirmation failed for ${this.device.name}: ${asErrorMessage(error)}.`
+        + ' Keeping optimistic HomeKit value until it expires.',
       );
     }
-    throw this.communicationFailure('Thermostat setpoint write was not applied by Salus cloud');
   }
 
   private async setTargetHeatingCoolingState(value: CharacteristicValue): Promise<void> {
@@ -909,6 +966,9 @@ export class SalusPlatformAccessory {
       writes[this.writeTargets.holdType] = requestedOff ? 7 : 2;
     }
     await this.platform.writeDeviceProperties(this.device, writes);
+    if (requestedOff) {
+      this.optimisticThermostatTarget = null;
+    }
 
     this.cachedTargetState = hkState;
     this.cachedSystemMode = mode;
@@ -1011,6 +1071,27 @@ export class SalusPlatformAccessory {
   private communicationFailure(message: string): Error {
     this.platform.log.error(`${message} [${this.device.name} / ${this.device.dsn}]`);
     return new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+  }
+
+  private setOptimisticThermostatTarget(valueC: number, writeSequence: number): void {
+    this.optimisticThermostatTarget = {
+      valueC: clamp(valueC, 4.5, 35),
+      expiresAtEpochMs: Date.now() + THERMOSTAT_OPTIMISTIC_TARGET_TTL_MS,
+      writeSequence,
+    };
+    this.service.updateCharacteristic(this.platform.Characteristic.TargetTemperature, this.optimisticThermostatTarget.valueC);
+  }
+
+  private getActiveOptimisticThermostatTarget(): OptimisticThermostatTarget | undefined {
+    const optimistic = this.optimisticThermostatTarget;
+    if (!optimistic) {
+      return undefined;
+    }
+    if (optimistic.expiresAtEpochMs <= Date.now()) {
+      this.optimisticThermostatTarget = null;
+      return undefined;
+    }
+    return optimistic;
   }
 
   private getServiceDisplayName(kind: HomeKitDeviceKind): string {
