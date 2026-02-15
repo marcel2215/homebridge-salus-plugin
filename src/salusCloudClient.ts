@@ -141,6 +141,7 @@ const DEVICE_SHADOW_BLOCK_TTL_MS = 15 * 60_000;
 const MAX_OCCUPANTS_DETAIL_TARGETS_PER_SYNC = 40;
 const MAX_OCCUPANTS_DETAIL_DISCOVERY_DURATION_MS = 45_000;
 const MAX_OCCUPANTS_DETAIL_TYPES_PER_TARGET = 4;
+const SEVERE_DISCOVERY_DROP_HOLDOFF_POLLS = 30;
 
 const STATUS_ALLOW_PATH_FALLBACK = new Set([404, 405, 426]);
 const STATUS_ALLOW_WRITE_SHAPE_FALLBACK = new Set([400, 404, 405, 409, 415, 422]);
@@ -305,6 +306,7 @@ export class SalusCloudClient {
   private hasWarnedAboutDeviceShadowAuthFailure = false;
   private hasWarnedAboutLegacyProbeFailure = false;
   private hasWarnedAboutPartialDiscoveryFallback = false;
+  private consecutiveSevereDiscoveryDrops = 0;
   private hasEstablishedModernAuthContext = false;
   private lastKnownDevices: SalusDevice[] = [];
   private preferredShadowVariantDescription: string | null = null;
@@ -2186,15 +2188,26 @@ export class SalusCloudClient {
     const previous = this.lastKnownDevices;
     if (previous.length === 0 || devices.length >= previous.length) {
       this.hasWarnedAboutPartialDiscoveryFallback = false;
+      this.consecutiveSevereDiscoveryDrops = 0;
       return devices;
     }
 
     const severeDropThreshold = Math.max(1, Math.floor(previous.length * 0.8));
     const severeDropDetected = devices.length <= severeDropThreshold;
-    const authRestrictedDiscovery = this.getActiveBlockedSliderDetailsTargetCount() > 0
-      || this.isAllSliderDetailsBlocked()
-      || this.isModernDeviceShadowBlocked();
-    if (!severeDropDetected || !authRestrictedDiscovery) {
+    if (!severeDropDetected) {
+      this.hasWarnedAboutPartialDiscoveryFallback = false;
+      this.consecutiveSevereDiscoveryDrops = 0;
+      return devices;
+    }
+
+    this.consecutiveSevereDiscoveryDrops += 1;
+    if (this.consecutiveSevereDiscoveryDrops > SEVERE_DISCOVERY_DROP_HOLDOFF_POLLS) {
+      if (this.hasWarnedAboutPartialDiscoveryFallback) {
+        this.log.warn(
+          `Severe reduced discovery persisted for ${this.consecutiveSevereDiscoveryDrops} poll(s).`
+          + ' Accepting current Salus device list and allowing stale accessory cleanup.',
+        );
+      }
       this.hasWarnedAboutPartialDiscoveryFallback = false;
       return devices;
     }
@@ -2204,10 +2217,14 @@ export class SalusCloudClient {
       this.hasWarnedAboutPartialDiscoveryFallback = true;
       this.log.warn(
         `Salus discovery returned ${devices.length} device(s) while previous sync had ${previous.length}.`
-        + ' Keeping prior device list to avoid stale accessory churn until discovery stabilizes.',
+        + ` Keeping prior device list for up to ${SEVERE_DISCOVERY_DROP_HOLDOFF_POLLS} polls`
+        + ' to avoid stale accessory churn until discovery stabilizes.',
       );
     } else if (this.verboseLogging) {
-      this.log.debug(`Keeping previous device list (${previous.length}) during partial discovery result (${devices.length}).`);
+      this.log.debug(
+        `Keeping previous device list (${previous.length}) during severe partial discovery result (${devices.length})`
+        + ` [holdoff ${this.consecutiveSevereDiscoveryDrops}/${SEVERE_DISCOVERY_DROP_HOLDOFF_POLLS}].`,
+      );
     }
     return merged;
   }

@@ -18,6 +18,8 @@ const MIN_POLL_INTERVAL_SECONDS = 10;
 const MAX_POLL_INTERVAL_SECONDS = 300;
 const STALE_ACCESSORY_REMOVAL_GRACE_POLLS = 3;
 const POLL_BUSY_LOG_THROTTLE_MS = 30_000;
+const FULL_OMISSION_GUARD_HOLDOFF_POLLS = 30;
+const FULL_OMISSION_GUARD_LOG_THROTTLE_MS = 60_000;
 const POLL_FAILURE_BACKOFF_BASE_MS = 5_000;
 const POLL_FAILURE_BACKOFF_MAX_MS = 300_000;
 const POLL_DELAY_JITTER_FACTOR = 0.15;
@@ -169,6 +171,8 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
   private pollInProgress = false;
   private pollRequestedWhileBusy = false;
   private lastBusyPollLogEpochMs = 0;
+  private lastFullOmissionGuardLogEpochMs = 0;
+  private consecutiveFullOmissionPolls = 0;
   private lastFullDiscoveryEpochMs = 0;
   private boostPollingUntilEpochMs = 0;
   private consecutivePollFailures = 0;
@@ -560,6 +564,36 @@ export class SalusHomebridgePlatform implements DynamicPlatformPlugin {
   }
 
   private removeStaleAccessories(discoveredUuids: Set<string>): void {
+    if (discoveredUuids.size > 0 || this.accessories.size === 0) {
+      this.consecutiveFullOmissionPolls = 0;
+    }
+
+    if (this.accessories.size > 0 && discoveredUuids.size === 0) {
+      this.consecutiveFullOmissionPolls += 1;
+      if (this.consecutiveFullOmissionPolls > FULL_OMISSION_GUARD_HOLDOFF_POLLS) {
+        if (this.consecutiveFullOmissionPolls === (FULL_OMISSION_GUARD_HOLDOFF_POLLS + 1)) {
+          this.log.warn(
+            `Discovery has been empty for ${this.consecutiveFullOmissionPolls} consecutive polls.`
+            + ' Accepting empty discovery result and allowing stale accessory cleanup.',
+          );
+        }
+      } else {
+        this.missingAccessoryPollCounts.clear();
+        const now = Date.now();
+        if ((now - this.lastFullOmissionGuardLogEpochMs) >= FULL_OMISSION_GUARD_LOG_THROTTLE_MS) {
+          this.lastFullOmissionGuardLogEpochMs = now;
+          this.log.warn(
+            `Discovery returned 0 devices while ${this.accessories.size} accessory(ies) are cached.`
+            + ` Keeping existing accessories for up to ${FULL_OMISSION_GUARD_HOLDOFF_POLLS} polls`
+            + ' to avoid HomeKit re-enumeration during Salus cloud outages.',
+          );
+        }
+        return;
+      }
+
+      this.missingAccessoryPollCounts.clear();
+    }
+
     for (const uuid of discoveredUuids) {
       this.missingAccessoryPollCounts.delete(uuid);
     }
