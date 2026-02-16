@@ -70,7 +70,6 @@ const THERMOSTAT_COOL_SETPOINT_COMMAND = [
   'SetTargetTemperature',
 ];
 const THERMOSTAT_SYSTEM_MODE = ['SystemMode', 'SetSystemMode'];
-const THERMOSTAT_RUNNING_STATE = ['RunningState', 'RunningMode'];
 const THERMOSTAT_HOLD_TYPE = ['HoldType', 'SetHoldType'];
 const THERMOSTAT_HUMIDITY = ['RelativeHumidity_x100', 'RelativeHumidity', 'Humidity_x100', 'Humidity'];
 
@@ -483,7 +482,6 @@ export class SalusPlatformAccessory {
       THERMOSTAT_COOL_SETPOINT_COMMAND,
     );
     const systemModeRaw = getNumberProperty(this.latestProperties, THERMOSTAT_SYSTEM_MODE);
-    const runningStateRaw = getNumberProperty(this.latestProperties, THERMOSTAT_RUNNING_STATE);
     const holdTypeRaw = getNumberProperty(this.latestProperties, THERMOSTAT_HOLD_TYPE);
     const humidityRaw = getNumberProperty(this.latestProperties, THERMOSTAT_HUMIDITY);
 
@@ -515,7 +513,6 @@ export class SalusPlatformAccessory {
     }
 
     const targetState = mapSystemModeToTargetState(this.platform.Characteristic.TargetHeatingCoolingState, this.cachedSystemMode, holdTypeRaw);
-    const currentState = mapRunningStateToCurrentState(this.platform.Characteristic.CurrentHeatingCoolingState, runningStateRaw, holdTypeRaw);
     this.cachedTargetState = targetState;
 
     let targetTemp: number | undefined;
@@ -538,6 +535,16 @@ export class SalusPlatformAccessory {
         this.optimisticThermostatTarget = null;
       }
     }
+
+    const previousCurrentStateRaw = this.service.getCharacteristic(this.platform.Characteristic.CurrentHeatingCoolingState).value;
+    const currentState = resolveCurrentHeatingCoolingState(
+      this.platform.Characteristic.CurrentHeatingCoolingState,
+      targetState,
+      this.platform.Characteristic.TargetHeatingCoolingState.OFF,
+      currentTemp,
+      targetTemp,
+      previousCurrentStateRaw,
+    );
 
     if (currentTemp !== undefined) {
       this.service.updateCharacteristic(this.platform.Characteristic.CurrentTemperature, currentTemp);
@@ -1249,23 +1256,40 @@ function mapSystemModeToTargetState(
   return characteristic.HEAT;
 }
 
-function mapRunningStateToCurrentState(
+function resolveCurrentHeatingCoolingState(
   characteristic: CurrentCharacteristicType,
-  runningStateRaw: number | undefined,
-  holdTypeRaw: number | undefined,
+  targetState: number,
+  offTargetState: number,
+  currentTemp: number | undefined,
+  targetTemp: number | undefined,
+  previousCurrentStateRaw: CharacteristicValue | null,
 ): number {
-  if (holdTypeRaw !== undefined && Math.round(holdTypeRaw) === 7) {
-    return characteristic.OFF;
-  }
-  if (runningStateRaw === undefined) {
+  // Explicit OFF/standby always wins: never report "heating" while thermostat is off.
+  if (targetState === offTargetState) {
     return characteristic.OFF;
   }
 
-  const normalized = Math.round(runningStateRaw);
-  if (!Number.isFinite(normalized) || normalized <= 0) {
-    return characteristic.OFF;
+  if (currentTemp !== undefined && targetTemp !== undefined) {
+    const roundedCurrent = roundTemperatureToTenths(currentTemp);
+    const roundedTarget = roundTemperatureToTenths(targetTemp);
+    return roundedCurrent < roundedTarget ? characteristic.HEAT : characteristic.OFF;
   }
-  return characteristic.HEAT;
+
+  const previousCurrentState = previousCurrentStateRaw === null
+    ? undefined
+    : parseCharacteristicNumber(previousCurrentStateRaw);
+  if (previousCurrentState !== undefined) {
+    const normalized = Math.round(previousCurrentState);
+    if (normalized === characteristic.HEAT || normalized === characteristic.OFF) {
+      return normalized;
+    }
+  }
+
+  return characteristic.OFF;
+}
+
+function roundTemperatureToTenths(value: number): number {
+  return Math.round((value + Number.EPSILON) * 10) / 10;
 }
 
 function parseCharacteristicNumber(value: CharacteristicValue): number | undefined {
